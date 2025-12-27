@@ -1,0 +1,592 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+enum MessageType {
+  PUBLIC
+  PRIVATE
+}
+
+enum VerificationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum PaymentMethodType {
+  US_BANK
+  CARD
+  OTHER
+}
+
+enum PaymentMethodStatus {
+  ACTIVE // usable right now
+  PENDING_VERIFICATION // micro-deposits or processing
+  FAILED_VERIFICATION // verification failed / revoked
+  ARCHIVED // soft-deleted/disabled
+}
+
+model VerificationMedia {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  userId String @db.ObjectId
+  user   User   @relation("UserVerificationMedia", fields: [userId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  kind      VerificationMediaKind
+  title     String?
+  fileName  String?
+  mimeType  String?
+  content   Bytes?
+  createdAt DateTime              @default(now())
+
+  @@index([userId])
+}
+
+enum DocumentType {
+  CONTRACT
+  PAYSTUB
+  PHOTO_ID // if you still want the old single-photo option
+  ID_FRONT
+  ID_BACK
+  SELFIE
+}
+
+enum VerificationMediaKind {
+  ID_FRONT
+  ID_BACK
+  SELFIE
+}
+
+model User {
+  id       String @id @default(auto()) @map("_id") @db.ObjectId
+  name     String
+  phone    String @unique
+  email    String @unique
+  password String
+
+  role UserRole @default(USER)
+
+  dob       DateTime?
+  location  String?
+  maxLoan   Float?
+  summary   String?
+  createdAt DateTime  @default(now())
+
+  // Relations
+  loanRequests         LoanRequest[]  @relation("UserLoanRequests")
+  loansAsLender        Loan[]         @relation("LenderLoans")
+  loansAsBorrower      Loan[]         @relation("BorrowerLoans")
+  loanMessages         LoanMessage[]
+  loanOffers           LoanOffer[]    @relation("UserLoanOffers")
+  documents            Document[]
+  notifications        Notification[]
+  sentTransactions     Transaction[]  @relation("FromUser")
+  receivedTransactions Transaction[]  @relation("ToUser")
+  bankId               String?        @db.ObjectId
+  bank                 Bank?          @relation("UserBank", fields: [bankId], references: [id])
+  posts                Post[]
+
+  // Superuser
+  isSuperUser                 Boolean              @default(false)
+  superUserSince              DateTime?
+  subscriptionStatus          String?
+  subscription                Subscription?
+  LoanRequestMessage          LoanRequestMessage[]
+  superUserVerificationStatus String               @default("PENDING")
+
+  // Stripe identifiers
+  // - stripeCustomerId: one customer per user, holds *cards* + any bank PMs you attach
+  // - stripeAccountId:  Connect Express account used for payouts (receiving funds)
+  stripeCustomerId           String?
+  stripeAccountId            String?
+  connectOnboardingCompleted Boolean @default(false)
+
+  // Display helpers for payout banks (your existing fields)
+  defaultDebitBankLast4  String?
+  defaultPayoutBankLast4 String?
+
+  paymentMethods PaymentMethod[]
+
+  // NEW: Funding card used for charges (deposits, repayments, SuperUser fee)
+  fundingPaymentMethodId  String? // Stripe payment_method id (pm_xxx) for card
+  fundingCardLast4        String? // for showing “Visa •••• 4242”
+  fundingCardBrand        String? // e.g. "visa", "mastercard"
+  defaultFundingCardLast4 String? // optional, for display
+
+  // Direct loan feature
+  lenderListings           LenderListing[]
+  directRequestsAsBorrower DirectLoanRequest[] @relation("BorrowerRequests")
+  directRequestsAsLender   DirectLoanRequest[] @relation("LenderRequests")
+
+  // Per-user lending terms for $50/$100/$150/$200/$250
+  lendingTerms Json?
+
+  Wallet Wallet?
+
+  // Sign-up Verification
+  verificationStatus VerificationStatus @default(PENDING)
+  verifiedAt         DateTime?
+  verifiedById       String?            @db.ObjectId
+  verifier           User?              @relation("VerificationAdmin", fields: [verifiedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  verifiedUsers      User[]             @relation("VerificationAdmin")
+
+  verificationNotes String?
+  verificationMedia VerificationMedia[] @relation("UserVerificationMedia")
+
+  @@index([stripeCustomerId])
+  @@index([stripeAccountId])
+}
+
+model Subscription {
+  id                   String   @id @default(auto()) @map("_id") @db.ObjectId
+  stripeSubscriptionId String
+  status               String
+  startedAt            DateTime
+  user                 User     @relation(fields: [userId], references: [id])
+  userId               String   @unique @db.ObjectId
+}
+
+model LoanRequest {
+  id                 String               @id @default(auto()) @map("_id") @db.ObjectId
+  borrowerId         String               @db.ObjectId
+  borrower           User                 @relation("UserLoanRequests", fields: [borrowerId], references: [id])
+  amount             Float
+  duration           Int
+  interestRate       Float
+  purpose            String?
+  status             String               @default("OPEN")
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+  messages           LoanMessage[]
+  loan               Loan?                @relation("LoanToRequest")
+  loanOffers         LoanOffer[]          @relation("LoanRequestOffers")
+  offerAccepted      Boolean              @default(false)
+  LoanRequestMessage LoanRequestMessage[]
+
+  @@index([status, createdAt])
+}
+
+model Loan {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  // Canonical money fields going forward
+  principalCents  Int?
+  interestRateBps Int
+  termMonths      Int
+
+  // Legacy fields (keep temporarily; remove later)
+  amount       Float?
+  interestRate Float?
+  duration     Int?
+
+  fundedDate DateTime?
+
+  borrowerId String @db.ObjectId
+  borrower   User   @relation("BorrowerLoans", fields: [borrowerId], references: [id])
+
+  lenderId String @db.ObjectId
+  lender   User   @relation("LenderLoans", fields: [lenderId], references: [id])
+
+  loanRequestId String?      @unique @db.ObjectId
+  loanRequest   LoanRequest? @relation("LoanToRequest", fields: [loanRequestId], references: [id])
+
+  repayments Repayment[]
+  documents  Document[]
+  messages   LoanMessage[]
+
+  // Fees
+  platformFeeCents Int?
+  bankingFee       Float?
+  peerfundFee      Float?
+  totalFees        Float?
+  disbursedAmount  Float
+
+  // Stripe refs (destination charges)
+  transferGroup   String?
+  paymentIntentId String?
+  chargeId        String?
+
+  status LoanStatus @default(ACCEPTED)
+
+  fees Fee[] @relation("LoanToFee")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([borrowerId])
+  @@index([lenderId])
+  @@index([status])
+  @@index([paymentIntentId])
+  @@index([chargeId])
+}
+
+model Document {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String   @db.ObjectId
+  loanId    String?  @db.ObjectId
+  title     String
+  type      String
+  fileName  String
+  mimeType  String
+  content   Bytes
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id])
+  loan      Loan?    @relation(fields: [loanId], references: [id])
+
+  @@index([loanId])
+  @@index([userId])
+}
+
+model LoanMessage {
+  id            String       @id @default(auto()) @map("_id") @db.ObjectId
+  loanId        String       @db.ObjectId
+  loan          Loan         @relation(fields: [loanId], references: [id])
+  userId        String       @db.ObjectId
+  user          User         @relation(fields: [userId], references: [id])
+  content       String
+  createdAt     DateTime     @default(now())
+  LoanRequest   LoanRequest? @relation(fields: [loanRequestId], references: [id])
+  loanRequestId String?      @db.ObjectId
+
+  @@index([loanId])
+  @@index([userId])
+  @@index([createdAt])
+}
+
+model LoanRequestMessage {
+  id            String      @id @default(auto()) @map("_id") @db.ObjectId
+  loanRequestId String      @db.ObjectId
+  loanRequest   LoanRequest @relation(fields: [loanRequestId], references: [id])
+  userId        String      @db.ObjectId
+  user          User        @relation(fields: [userId], references: [id])
+  content       String
+  createdAt     DateTime    @default(now())
+
+  @@index([loanRequestId])
+  @@index([userId])
+  @@index([createdAt])
+}
+
+model LoanOffer {
+  id            String      @id @default(auto()) @map("_id") @db.ObjectId
+  loanRequestId String      @db.ObjectId
+  loanRequest   LoanRequest @relation("LoanRequestOffers", fields: [loanRequestId], references: [id])
+  lenderId      String      @db.ObjectId
+  lender        User        @relation("UserLoanOffers", fields: [lenderId], references: [id])
+  amount        Float
+  duration      Int
+  interestRate  Float
+  message       String?
+  createdAt     DateTime    @default(now())
+  status        String      @default("OPEN") // or use an enum if you prefer
+  acceptedAt    DateTime?
+
+  @@index([lenderId])
+  @@index([loanRequestId])
+}
+
+enum LoanStatus {
+  OFFERED
+  ACCEPTED
+  PROCESSING // ACH submitted; waiting for funds to clear
+  FUNDED // Stripe auto-transferred net to lender
+  FAILED
+  COMPLETED
+}
+
+model Repayment {
+  id               String    @id @default(auto()) @map("_id") @db.ObjectId
+  loanId           String    @db.ObjectId
+  loan             Loan      @relation(fields: [loanId], references: [id])
+  dueDate          DateTime
+  amountDue        Float
+  amountPaid       Float     @default(0)
+  bankingFee       Float     @default(0)
+  peerfundFee      Float     @default(0)
+  totalCharged     Float     @default(0)
+  basePayment      Float     @default(0)
+  paidAt           DateTime?
+  status           String    @default("PENDING")
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  autopayAttempted Boolean   @default(false)
+  autopaySuccess   Boolean?
+  failReason       String?
+  fees             Fee[]     @relation("RepaymentToFee")
+}
+
+model RepaymentSchedule {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+}
+
+// schema.prisma  — minimal fix for null user refs
+
+model Transaction {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  // keep your free-form type for now (you can upgrade to enum later)
+  type String
+
+  // 🔧 make user FKs optional (some rows may not have both users)
+  fromUserId String? @db.ObjectId
+  toUserId   String? @db.ObjectId
+
+  // 🔧 make these optional too (deposits/fees may not belong to a loan/repayment)
+  loanId      String? @db.ObjectId
+  repaymentId String? @db.ObjectId
+
+  amount      Float
+  peerfundFee Float @default(0)
+  bankingFee  Float @default(0)
+
+  // allow unprocessed rows to exist without a timestamp here
+  processedAt DateTime?
+  timestamp   DateTime? @default(now())
+
+  // 🔧 relations become optional to match the optional FKs
+  fromUser User? @relation("FromUser", fields: [fromUserId], references: [id])
+  toUser   User? @relation("ToUser", fields: [toUserId], references: [id])
+
+  @@index([fromUserId])
+  @@index([toUserId])
+  @@index([loanId])
+}
+
+model PaymentMethod {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  // Ownership
+  userId String @db.ObjectId
+  user   User   @relation(fields: [userId], references: [id])
+
+  // Stripe identifiers
+  stripePaymentMethodId String  @unique // "pm_..."
+  stripeCustomerId      String? // cache; owner’s Stripe customer
+  stripeMandateId       String? // ACH mandate (optional, from setup intent)
+  finConnAccountId      String? // Financial Connections account id (ACH)
+
+  // Type & display (works for both CARD and US_BANK)
+  type        PaymentMethodType @default(US_BANK)
+  brand       String            @default("us_bank_account") // e.g., "visa", "checking"
+  last4       String?
+  bankName    String? // ACH: e.g., "Chase"
+  accountType String? // ACH: "checking" | "savings"
+  expMonth    Int? // CARD only
+  expYear     Int? // CARD only
+  funding     String? // CARD: "credit" | "debit" | "prepaid"
+  country     String? // "US", etc.
+
+  // De-dup for ACH (Stripe us_bank_account.fingerprint)
+  bankFingerprint String?
+
+  // Status & defaults
+  status          PaymentMethodStatus @default(ACTIVE)
+  isDefaultCharge Boolean             @default(false) // default for borrower charges (repayments)
+  isDefaultPayout Boolean             @default(false) // default for lender payouts
+  // Back-compat flags (kept so you don't break existing code; you can retire later)
+  isDefault       Boolean             @default(false) // legacy: wallet deposits / general
+  isForLoans      Boolean             @default(false) // legacy: borrower receiving bank
+
+  // Lifecycle
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  archivedAt DateTime?
+
+  // Never store these; keep @ignore (documentation)
+  accountNumber String? @ignore
+  routingNumber String? @ignore
+
+  @@index([userId])
+  @@index([userId, isDefaultCharge])
+  @@index([userId, isDefaultPayout])
+  @@index([userId, isDefault])
+  @@index([userId, isForLoans])
+  @@index([stripeCustomerId])
+  @@index([bankFingerprint])
+}
+
+model Notification {
+  id        String    @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String    @db.ObjectId
+  type      String
+  message   String
+  data      Json?
+  isRead    Boolean   @default(false)
+  createdAt DateTime  @default(now())
+  readAt    DateTime?
+  user      User      @relation(fields: [userId], references: [id])
+
+  @@index([userId, isRead, createdAt])
+}
+
+model Fee {
+  id          String     @id @default(auto()) @map("_id") @db.ObjectId
+  loanId      String     @db.ObjectId
+  repaymentId String?    @db.ObjectId
+  type        String
+  amount      Float
+  toUserId    String?    @db.ObjectId
+  createdAt   DateTime   @default(now())
+  loan        Loan       @relation("LoanToFee", fields: [loanId], references: [id])
+  repayment   Repayment? @relation("RepaymentToFee", fields: [repaymentId], references: [id])
+}
+
+model Bank {
+  id    String @id @default(auto()) @map("_id") @db.ObjectId
+  name  String
+  users User[] @relation("UserBank")
+}
+
+model Post {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  content   String
+  userId    String   @db.ObjectId
+  user      User     @relation(fields: [userId], references: [id])
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([userId])
+}
+
+model LedgerEntry {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  loanId       String?  @db.ObjectId
+  repaymentId  String?  @db.ObjectId
+  type         String // BORROWER_DEBIT | LENDER_CREDIT | PLATFORM_FEE | STRIPE_FEE | REVERSAL
+  amountCents  Int
+  currency     String   @default("usd")
+  direction    String   @default("debit") // debit/credit (from platform POV)
+  stripePiId   String?
+  stripeXferId String?
+  meta         Json?
+  createdAt    DateTime @default(now())
+
+  @@index([loanId, repaymentId, createdAt])
+}
+
+model LenderListing {
+  id       String @id @default(auto()) @map("_id") @db.ObjectId
+  lenderId String @db.ObjectId
+  lender   User   @relation(fields: [lenderId], references: [id])
+
+  // The standing offer:
+  apr       Float // displayed APR (e.g., 10 means 10%)
+  minAmount Float
+  maxAmount Float
+  minMonths Int
+  maxMonths Int
+
+  // Guardrails:
+  autoApprove         Boolean @default(false) // turn on/off instant approval
+  autoApproveUpTo     Float? // largest amount eligible for instant approval
+  dailyAutoApproveCap Float? // optional per-day cap (simple anti-abuse)
+
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // optional: copy for display
+  headline    String? // "I lend $100–$600 at 10% APR"
+  description String?
+
+  // 🔧 Back-relation for DirectLoanRequest.listing
+  requests DirectLoanRequest[] @relation("ListingRequests")
+}
+
+model DirectLoanRequest {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  // optional: a request can be created even if not from a listing
+  listingId String?        @db.ObjectId
+  listing   LenderListing? @relation("ListingRequests", fields: [listingId], references: [id])
+
+  lenderId String @db.ObjectId
+  lender   User   @relation("LenderRequests", fields: [lenderId], references: [id])
+
+  borrowerId String @db.ObjectId
+  borrower   User   @relation("BorrowerRequests", fields: [borrowerId], references: [id])
+
+  amount Float
+  months Int
+  apr    Float
+
+  status    String    @default("PENDING") // PENDING | AUTO_APPROVED | APPROVED | DECLINED | CANCELLED | DISBURSED
+  createdAt DateTime  @default(now())
+  decidedAt DateTime?
+  notes     String?
+
+  loanId String? @db.ObjectId
+
+  @@index([lenderId])
+  @@index([borrowerId])
+  @@index([listingId])
+}
+
+// enums
+enum WalletEntryType {
+  DEPOSIT // funds added from card/bank
+  WITHDRAWAL // funds sent out to bank
+  HOLD // reserve funds for a pending loan
+  RELEASE // release a previous hold (cancel/expire)
+  DISBURSE // send funds to borrower (fund the loan)
+  REPAYMENT // borrower repays; lender receives
+  FEE // platform fee
+  ADJUSTMENT // admin fix
+}
+
+model Wallet {
+  id     String @id @default(auto()) @map("_id") @db.ObjectId
+  userId String @unique @db.ObjectId
+  user   User   @relation(fields: [userId], references: [id])
+
+  // “Available” is what the user can spend; “pending” is held (reserved)
+  availableCents Int @default(0)
+  pendingCents   Int @default(0)
+
+  ledger WalletLedger[]
+  holds  WalletHold[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model WalletLedger {
+  id                String          @id @default(auto()) @map("_id") @db.ObjectId
+  walletId          String          @db.ObjectId
+  wallet            Wallet          @relation(fields: [walletId], references: [id])
+  type              WalletEntryType
+  amountCents       Int // positive for absolute amount
+  direction         String // "CREDIT" or "DEBIT" (for human reads)
+  balanceAfterCents Int // available balance AFTER this row
+  referenceType     String? // e.g. "LoanRequest", "DirectLoanRequest"
+  referenceId       String?         @db.ObjectId
+  metadata          Json?
+  createdAt         DateTime        @default(now())
+
+  @@index([walletId, createdAt])
+}
+
+model WalletHold {
+  id            String    @id @default(auto()) @map("_id") @db.ObjectId
+  walletId      String    @db.ObjectId
+  wallet        Wallet    @relation(fields: [walletId], references: [id])
+  amountCents   Int
+  reason        String? // e.g. "DirectLoanRequest"
+  directReqId   String?   @db.ObjectId
+  loanRequestId String?   @db.ObjectId
+  expiresAt     DateTime?
+  releasedAt    DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@index([walletId, createdAt])
+}
