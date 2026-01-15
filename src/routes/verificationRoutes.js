@@ -1,65 +1,51 @@
-const router = require('express').Router();
-const multer = require('multer');
-const upload = multer(); // memory storage
-const auth = require('../middleware/authMiddleware');
-const ctrl = require('../controllers/verificationController');
+// src/routes/VerifiedRoute.jsx
+import React, { useEffect, useState } from 'react';
+import { Navigate, Outlet } from 'react-router-dom';
 
-// user routes
-router.get('/verification/status', auth.authenticateToken, ctrl.getStatus);
+const API_BASE_URL = (process.env.REACT_APP_API_URL || 'http://localhost:5050').replace(/\/$/, '');
 
-// New photo uploads
-router.post(
-  '/verification/id/front',
-  auth.authenticateToken,
-  upload.single('file'),
-  ctrl.uploadIdFront
-);
+export default function VerifiedRoute() {
+  const [loading, setLoading] = useState(true);
+  const [allowed, setAllowed] = useState(false);
 
-router.post(
-  '/verification/id/back',
-  auth.authenticateToken,
-  upload.single('file'),
-  ctrl.uploadIdBack
-);
+  useEffect(() => {
+    const token = localStorage.getItem('token');
 
-router.post(
-  '/verification/selfie',
-  auth.authenticateToken,
-  upload.single('file'),
-  ctrl.uploadSelfie
-);
+    if (!token) {
+      setAllowed(false);
+      setLoading(false);
+      return;
+    }
 
-// Optional: keep paystub endpoint
-router.post(
-  '/verification/paystub',
-  auth.authenticateToken,
-  upload.single('file'),
-  ctrl.uploadPaystub
-);
+    const run = async () => {
+      try {
+        const res = await fetch(`${API_BASE_URL}/api/verification/status`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
 
-// admin routes
-router.get(
-  '/admin/verification/pending',
-  auth.authenticateToken,
-  ctrl.adminListPending
-);
+        const text = await res.text();
 
-router.get(
-  '/admin/verification/:userId/detail',
-  auth.authenticateToken,
-  ctrl.adminGetDetail
-);
+        let data = null;
+        try {
+          data = text ? JSON.parse(text) : null;
+        } catch {
+          throw new Error(text || 'Non-JSON response from server');
+        }
 
-router.post(
-  '/admin/verification/:userId/approve',
-  auth.authenticateToken,
-  ctrl.adminApprove
-);
+        const status = data?.status || 'PENDING';
+        setAllowed(status === 'APPROVED');
+      } catch (e) {
+        console.error('VerifiedRoute error:', e);
+        setAllowed(false);
+      } finally {
+        setLoading(false);
+      }
+    };
 
-router.post(
-  '/admin/verification/:userId/reject',
-  auth.authenticateToken,
-  ctrl.adminReject
-);
+    run();
+  }, []);
 
-module.exports = router;
+  if (loading) return null;
+  if (!allowed) return <Navigate to="/verify" replace />;
+  return <Outlet />;
+}
