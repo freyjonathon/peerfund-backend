@@ -1,51 +1,43 @@
-// src/routes/VerifiedRoute.jsx
-import React, { useEffect, useState } from 'react';
-import { Navigate, Outlet } from 'react-router-dom';
+// routes/verificationRoutes.js
+const router = require('express').Router();
+const multer = require('multer');
+const upload = multer(); // memory storage
+const auth = require('../middleware/authMiddleware');
+const ctrl = require('../controllers/verificationController');
 
-const API_BASE_URL = (process.env.REACT_APP_API_URL || 'http://localhost:5050').replace(/\/$/, '');
+// =======================
+// USER ROUTES
+// =======================
 
-export default function VerifiedRoute() {
-  const [loading, setLoading] = useState(true);
-  const [allowed, setAllowed] = useState(false);
+// GET /api/verification/status
+router.get('/verification/status', auth.authenticateToken, ctrl.getStatus);
 
-  useEffect(() => {
-    const token = localStorage.getItem('token');
+// POST /api/verification/id/front
+router.post('/verification/id/front', auth.authenticateToken, upload.single('file'), ctrl.uploadIdFront);
 
-    if (!token) {
-      setAllowed(false);
-      setLoading(false);
-      return;
-    }
+// POST /api/verification/id/back
+router.post('/verification/id/back', auth.authenticateToken, upload.single('file'), ctrl.uploadIdBack);
 
-    const run = async () => {
-      try {
-        const res = await fetch(`${API_BASE_URL}/api/verification/status`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
+// POST /api/verification/selfie
+router.post('/verification/selfie', auth.authenticateToken, upload.single('file'), ctrl.uploadSelfie);
 
-        const text = await res.text();
+// OPTIONAL: POST /api/verification/paystub
+router.post('/verification/paystub', auth.authenticateToken, upload.single('file'), ctrl.uploadPaystub);
 
-        let data = null;
-        try {
-          data = text ? JSON.parse(text) : null;
-        } catch {
-          throw new Error(text || 'Non-JSON response from server');
-        }
+// =======================
+// ADMIN ROUTES
+// =======================
 
-        const status = data?.status || 'PENDING';
-        setAllowed(status === 'APPROVED');
-      } catch (e) {
-        console.error('VerifiedRoute error:', e);
-        setAllowed(false);
-      } finally {
-        setLoading(false);
-      }
-    };
+// GET /api/admin/verification/pending
+router.get('/admin/verification/pending', auth.authenticateToken, ctrl.adminListPending);
 
-    run();
-  }, []);
+// GET /api/admin/verification/:userId/detail
+router.get('/admin/verification/:userId/detail', auth.authenticateToken, ctrl.adminGetDetail);
 
-  if (loading) return null;
-  if (!allowed) return <Navigate to="/verify" replace />;
-  return <Outlet />;
-}
+// POST /api/admin/verification/:userId/approve
+router.post('/admin/verification/:userId/approve', auth.authenticateToken, ctrl.adminApprove);
+
+// POST /api/admin/verification/:userId/reject
+router.post('/admin/verification/:userId/reject', auth.authenticateToken, ctrl.adminReject);
+
+module.exports = router;
