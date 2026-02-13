@@ -53,35 +53,60 @@ const app = express();
 app.disable('x-powered-by');
 
 /* ----------------------------- CORS ----------------------------- */
-const ORIGINS = (
-  process.env.FRONTEND_ORIGIN || 'http://localhost:3000,http://127.0.0.1:3000'
+const ORIGINS = (process.env.FRONTEND_ORIGIN ||
+  'http://localhost:3000,http://127.0.0.1:3000,https://www.peerfundmarket.com,https://peerfundmarket.com'
 )
   .split(',')
-  .map((s) => s.trim());
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+function normalizeOrigin(o) {
+  if (!o) return o;
+  // normalize trailing slash
+  return o.replace(/\/$/, '');
+}
 
 function originAllowed(origin) {
-  return !origin || ORIGINS.includes(origin);
+  if (!origin) return true; // allow same-origin / server-to-server
+  const o = normalizeOrigin(origin);
+
+  if (ORIGINS.includes(o)) return true;
+
+  // treat www/non-www as equivalent
+  if (o.startsWith('https://www.')) {
+    const nonWww = o.replace('https://www.', 'https://');
+    if (ORIGINS.includes(nonWww)) return true;
+  }
+  if (o.startsWith('https://')) {
+    const www = o.replace('https://', 'https://www.');
+    if (ORIGINS.includes(www)) return true;
+  }
+
+  return false;
 }
 
 app.use((req, res, next) => {
-  const origin = req.headers.origin;
+  const origin = req.headers.origin ? normalizeOrigin(req.headers.origin) : null;
+
   if (originAllowed(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin || ORIGINS[0]);
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader(
-      'Access-Control-Allow-Methods',
-      'GET,POST,PUT,PATCH,DELETE,OPTIONS'
-    );
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+
     const reqHeaders = req.headers['access-control-request-headers'];
     res.setHeader(
       'Access-Control-Allow-Headers',
       reqHeaders || 'Content-Type, Authorization'
     );
   }
+
+  // Always end preflight cleanly
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
+
+console.log('CORS origins allowed:', ORIGINS);
 
 /* -------------------- RAW webhooks (before JSON) -------------------- */
 
