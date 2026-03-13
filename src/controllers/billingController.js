@@ -56,25 +56,56 @@ exports.setFundingPaymentMethod = async (req, res) => {
       return res.status(400).json({ error: 'paymentMethodId is required' });
     }
 
-    // Optional sanity check that PM belongs to this user’s customer
-    const pm = await stripe.paymentMethods.retrieve(paymentMethodId);
-
     const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    if (pm.customer && user.stripeCustomerId && pm.customer !== user.stripeCustomerId) {
+    if (!user.stripeCustomerId) {
+      return res.status(400).json({ error: 'User is missing stripeCustomerId' });
+    }
+
+    let pm = await stripe.paymentMethods.retrieve(paymentMethodId);
+
+    // If PM is attached to another customer, block it
+    if (pm.customer && pm.customer !== user.stripeCustomerId) {
       return res.status(400).json({ error: 'Payment method belongs to another customer' });
     }
 
-    await prisma.user.update({
-      where: { id: userId },
-      data: { fundingPaymentMethodId: paymentMethodId },
+    // If PM is not attached yet, attach it
+    if (!pm.customer) {
+      pm = await stripe.paymentMethods.attach(paymentMethodId, {
+        customer: user.stripeCustomerId,
+      });
+    }
+
+    // Save as default invoice payment method on Stripe customer too (optional but helpful)
+    await stripe.customers.update(user.stripeCustomerId, {
+      invoice_settings: {
+        default_payment_method: paymentMethodId,
+      },
     });
 
-    return res.json({ ok: true });
+    const brand = pm.card?.brand || null;
+    const last4 = pm.card?.last4 || null;
+
+    await prisma.user.update({
+      where: { id: userId },
+      data: {
+        fundingPaymentMethodId: paymentMethodId,
+        fundingCardBrand: brand,
+        fundingCardLast4: last4,
+        defaultFundingCardLast4: last4,
+      },
+    });
+
+    return res.json({
+      ok: true,
+      fundingPaymentMethodId: paymentMethodId,
+      fundingCardBrand: brand,
+      fundingCardLast4: last4,
+    });
   } catch (err) {
     console.error('setFundingPaymentMethod error:', err);
-    return res.status(500).json({ error: 'Failed to save funding card' });
+    return res.status(500).json({ error: err?.message || 'Failed to save funding card' });
   }
 };
 

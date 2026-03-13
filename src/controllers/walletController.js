@@ -214,32 +214,38 @@ exports.depositFromFundingCard = async (req, res) => {
     const updatedWallet = await prisma.wallet.findUnique({ where: { id: wallet.id } });
 
     await prisma.walletLedger.create({
-      data: {
-        walletId: wallet.id,
-        type: 'DEPOSIT',
-        amountCents,
-        direction: 'CREDIT',
-        balanceAfterCents: updatedWallet.availableCents,
-        referenceType: 'StripePI',
-        referenceId: updatedWallet.id,
-        metadata: {
-          externalId: pi.id,
-          provider: 'stripe',
-          status: 'SUCCEEDED',
-        },
-      },
-    });
+  data: {
+    walletId: wallet.id,
+    type: 'DEPOSIT',
+    amountCents,
+    direction: 'CREDIT',
+    balanceAfterCents: updatedWallet.availableCents,
+    referenceType: 'StripePI',
+    referenceId: pi.id,
+    metadata: {
+      externalId: pi.id,
+      provider: 'stripe',
+      status: 'SUCCEEDED',
+    },
+  },
+});
 
     return res.json({
       ok: true,
       availableCents: updatedWallet.availableCents,
       pendingCents: updatedWallet.pendingCents,
     });
-  } catch (err) {
+    } catch (err) {
     console.error('depositFromFundingCard error:', err);
+
+    const stripeMsg =
+      err?.raw?.message ||
+      err?.message ||
+      'Failed to deposit from funding card';
+
     return res.status(500).json({
       ok: false,
-      error: err?.message || 'Failed to deposit from funding card',
+      error: stripeMsg,
     });
   }
 };
