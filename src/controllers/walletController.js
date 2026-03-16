@@ -117,14 +117,21 @@ exports.createDepositIntent = async (req, res) => {
 
     // Fallback: no Stripe configured → simulate instant deposit
     await incrementAvailable(wallet.id, amountCents);
-    await createLedger(wallet.id, {
-      type: 'DEPOSIT',
-      amountCents,
-      direction: 'CREDIT',
-      referenceType: 'Simulated',
-      referenceId: null,
-      metadata: { status: 'SETTLED', provider: 'simulated' },
-    });
+    await prisma.walletLedger.create({
+  data: {
+    walletId: wallet.id,
+    type: 'WITHDRAWAL',
+    amountCents,
+    direction: 'DEBIT',
+    balanceAfterCents: updatedWallet.availableCents,
+    referenceType: 'ManualPayout',
+    referenceId: null,
+    metadata: {
+      status: 'COMPLETED',
+      provider: stripe ? 'stripe' : 'simulated',
+    },
+  },
+});
 
     const updated = await prisma.wallet.findUnique({ where: { id: wallet.id } });
     return res.json({
@@ -270,23 +277,18 @@ exports.withdrawFunds = async (req, res) => {
     const dollars = Number(amountDollars);
 
     if (!Number.isFinite(dollars) || dollars <= 0) {
-      return res
-        .status(400)
-        .json({ error: 'Valid amountDollars is required' });
+      return res.status(400).json({ error: 'Valid amountDollars is required' });
     }
 
     const amountCents = Math.round(dollars * 100);
 
-    // Make sure the user has a wallet and enough balance
     const wallet = await getWalletOrCreate(userId);
 
     if (wallet.availableCents < amountCents) {
-      return res
-        .status(400)
-        .json({ error: 'Insufficient wallet balance for withdrawal' });
+      return res.status(400).json({ error: 'Insufficient wallet balance for withdrawal' });
     }
 
-    // Decrement available balance
+    // First update the wallet balance
     const updatedWallet = await prisma.wallet.update({
       where: { id: wallet.id },
       data: {
@@ -294,26 +296,35 @@ exports.withdrawFunds = async (req, res) => {
       },
     });
 
-    // Record ledger entry – adjust `type` to match your enum
-    await createLedger(wallet.id, {
-      type: 'WITHDRAWAL',        // ✅ make sure this exists in your WalletEntryType enum
-      amountCents,
-      direction: 'DEBIT',        // money leaving wallet
-      referenceType: 'ManualPayout',
-      referenceId: null,
-      metadata: {
-        status: 'COMPLETED',
-        provider: stripe ? 'stripe' : 'simulated',
+    // Then write the ledger row using the ACTUAL post-withdraw balance
+    await prisma.walletLedger.create({
+      data: {
+        walletId: wallet.id,
+        type: 'WITHDRAWAL',
+        amountCents,
+        direction: 'DEBIT',
+        balanceAfterCents: updatedWallet.availableCents,
+        referenceType: 'ManualPayout',
+        referenceId: null,
+        metadata: {
+          status: 'COMPLETED',
+          provider: stripe ? 'stripe' : 'simulated',
+        },
       },
     });
 
     return res.json({
       ok: true,
       availableCents: updatedWallet.availableCents,
+      pendingCents: updatedWallet.pendingCents,
       available: updatedWallet.availableCents / 100,
+      pending: updatedWallet.pendingCents / 100,
     });
   } catch (err) {
     console.error('withdrawFunds error:', err);
-    return res.status(500).json({ error: 'Failed to withdraw funds' });
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || 'Failed to withdraw funds',
+    });
   }
 };
