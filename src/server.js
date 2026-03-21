@@ -1,8 +1,14 @@
 // server.js
 require('dotenv').config();
 
+const stripeKey = process.env.STRIPE_SECRET_KEY || '';
+console.log(`Stripe key prefix: ${stripeKey.slice(0, 7)}`);
+
+const { validateEnv } = require('./utils/validateEnv');
+validateEnv();
+
 const express = require('express');
-console.log("✅ PeerFund backend booted:", new Date().toISOString());
+console.log('✅ PeerFund backend booted:', new Date().toISOString());
 
 const cron = require('node-cron');
 const cookieParser = require('cookie-parser');
@@ -31,9 +37,9 @@ const inlineDiscussionRoutes = require('./routes/inlineDiscussionRoutes');
 const verificationRoutes = require('./routes/verificationRoutes');
 const paymentsRoutes = require('./routes/payments');
 const directRequestRoutes = require('./routes/directRequestRoutes');
-const stripeRoutes = require('./routes/stripeRoutes'); // normal JSON routes
+const stripeRoutes = require('./routes/stripeRoutes');
 
-// ✅ Admin transactions routes (make sure this file exists)
+// Admin transactions
 const adminTransactionRoutes = require('./routes/adminTransactionRoutes');
 
 // Wallet
@@ -44,8 +50,6 @@ const billingRoutes = require('./routes/billingRoutes');
 // Webhook controllers
 const paymentsController = require('./controllers/paymentsController');
 const { getPublicUserProfileById } = require('./controllers/userController');
-
-// Stripe funding webhook handler
 const stripeFundingWebhook =
   require('./controllers/stripeWebhookController').handleStripeWebhook;
 
@@ -53,7 +57,8 @@ const app = express();
 app.disable('x-powered-by');
 
 /* ----------------------------- CORS ----------------------------- */
-const ORIGINS = (process.env.FRONTEND_ORIGIN ||
+const ORIGINS = (
+  process.env.FRONTEND_ORIGIN ||
   'http://localhost:3000,http://127.0.0.1:3000,https://www.peerfundmarket.com,https://peerfundmarket.com'
 )
   .split(',')
@@ -62,12 +67,12 @@ const ORIGINS = (process.env.FRONTEND_ORIGIN ||
 
 function normalizeOrigin(o) {
   if (!o) return o;
-  // normalize trailing slash
   return o.replace(/\/$/, '');
 }
 
 function originAllowed(origin) {
-  if (!origin) return true; // allow same-origin / server-to-server
+  if (!origin) return true;
+
   const o = normalizeOrigin(origin);
 
   if (ORIGINS.includes(o)) return true;
@@ -77,6 +82,7 @@ function originAllowed(origin) {
     const nonWww = o.replace('https://www.', 'https://');
     if (ORIGINS.includes(nonWww)) return true;
   }
+
   if (o.startsWith('https://')) {
     const www = o.replace('https://', 'https://www.');
     if (ORIGINS.includes(www)) return true;
@@ -92,7 +98,10 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', origin || ORIGINS[0]);
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.setHeader(
+      'Access-Control-Allow-Methods',
+      'GET,POST,PUT,PATCH,DELETE,OPTIONS'
+    );
 
     const reqHeaders = req.headers['access-control-request-headers'];
     res.setHeader(
@@ -101,7 +110,6 @@ app.use((req, res, next) => {
     );
   }
 
-  // Always end preflight cleanly
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -132,7 +140,7 @@ app.post(
   walletController.stripeWebhook
 );
 
-// 3) Loan funding webhook (destination charges / transfers)
+// 3) Loan funding webhook
 app.post(
   '/api/stripe/webhook',
   express.raw({ type: 'application/json' }),
@@ -146,7 +154,6 @@ app.post(
 /* ---------------------------- Parsers ------------------------------- */
 app.use(cookieParser());
 
-// JSON parser AFTER raw webhook routes
 app.use(
   express.json({
     verify: (req, _res, buf) => {
@@ -180,16 +187,16 @@ app.use('/api', verificationRoutes);
 app.use('/api/direct-requests', directRequestRoutes);
 app.use('/api/billing', billingRoutes);
 
-// ✅ Admin transactions endpoint (so /api/admin/transactions works)
+// Admin transactions endpoint
 app.use('/api', adminTransactionRoutes);
 
-// ✅ other Stripe JSON routes (ensure-customer, onboarding, etc.)
+// Stripe JSON routes
 app.use('/api/stripe', stripeRoutes);
 
-// Wallet protected routes (webhook excluded above)
+// Wallet protected routes
 app.use('/api/wallet', authenticateToken, walletRoutes);
 
-// Payments protected routes (webhook excluded above)
+// Payments protected routes
 app.use('/api/payments', authenticateToken, paymentsRoutes);
 
 /* ------------------------ Convenience route ------------------------- */
@@ -228,7 +235,9 @@ cron.schedule('0 0 * * *', async () => {
 /* --------------------------- Error handler --------------------------- */
 app.use((err, _req, res, _next) => {
   console.error('Unhandled error:', err);
-  if (!res.headersSent) res.status(500).json({ message: 'Internal server error' });
+  if (!res.headersSent) {
+    res.status(500).json({ message: 'Internal server error' });
+  }
 });
 
 /* ---------------------------- Startup ------------------------------- */

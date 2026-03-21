@@ -5,8 +5,7 @@ const { getVerificationChecklist, REQUIRED_PAYSTUBS } = require('../utils/verifi
 /* -------------------------------------------------------------------------- */
 /* Upload validation                                                          */
 /* -------------------------------------------------------------------------- */
-
-const MAX_BYTES = 6 * 1024 * 1024; // 6MB
+const MAX_BYTES = 25 * 1024 * 1024; // 25MB
 
 function getAuthUserId(req) {
   return req.user?.userId || req.user?.id || null;

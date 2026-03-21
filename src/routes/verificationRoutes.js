@@ -8,7 +8,7 @@ const ctrl = require('../controllers/verificationController');
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 6 * 1024 * 1024, // 6MB per file (adjust as you want)
+    limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
   },
 });
 
