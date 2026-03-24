@@ -12,6 +12,14 @@ exports.createCardSetupIntent = async (req, res) => {
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
 
+    // 🔍 Debug: confirm which Stripe platform account this backend is using
+    const acct = await stripe.accounts.retrieve();
+    console.log('Stripe platform account:', {
+      id: acct.id,
+      email: acct.email,
+      country: acct.country,
+    });
+
     const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user) return res.status(404).json({ error: 'User not found' });
 
@@ -24,9 +32,20 @@ exports.createCardSetupIntent = async (req, res) => {
         email: user.email || undefined,
       });
       customerId = customer.id;
+
       await prisma.user.update({
         where: { id: userId },
         data: { stripeCustomerId: customerId },
+      });
+
+      console.log('Stripe customer created:', {
+        userId,
+        customerId,
+      });
+    } else {
+      console.log('Using existing Stripe customer:', {
+        userId,
+        customerId,
       });
     }
 
@@ -36,10 +55,18 @@ exports.createCardSetupIntent = async (req, res) => {
       usage: 'off_session',
     });
 
+    // 🔍 Debug: confirm exactly what was created
+    console.log('SetupIntent created:', {
+      id: si.id,
+      livemode: si.livemode,
+      customer: si.customer,
+      status: si.status,
+    });
+
     return res.json({ clientSecret: si.client_secret });
   } catch (err) {
     console.error('createCardSetupIntent error:', err);
-    return res.status(500).json({ error: 'Failed to create card setup intent' });
+    return res.status(500).json({ error: err?.message || 'Failed to create card setup intent' });
   }
 };
 
@@ -77,7 +104,7 @@ exports.setFundingPaymentMethod = async (req, res) => {
       });
     }
 
-    // Save as default invoice payment method on Stripe customer too (optional but helpful)
+    // Save as default invoice payment method on Stripe customer too
     await stripe.customers.update(user.stripeCustomerId, {
       invoice_settings: {
         default_payment_method: paymentMethodId,
@@ -95,6 +122,14 @@ exports.setFundingPaymentMethod = async (req, res) => {
         fundingCardLast4: last4,
         defaultFundingCardLast4: last4,
       },
+    });
+
+    console.log('Funding payment method saved:', {
+      userId,
+      paymentMethodId,
+      customerId: user.stripeCustomerId,
+      brand,
+      last4,
     });
 
     return res.json({
