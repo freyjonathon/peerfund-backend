@@ -12,7 +12,6 @@ exports.createCardSetupIntent = async (req, res) => {
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
 
-    // 🔍 Debug: confirm which Stripe platform account this backend is using
     const acct = await stripe.accounts.retrieve();
     console.log('Stripe platform account:', {
       id: acct.id,
@@ -23,14 +22,35 @@ exports.createCardSetupIntent = async (req, res) => {
     const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    // Ensure we have a Stripe customer
     let customerId = user.stripeCustomerId;
+
+    // If we already have a customer ID, verify it still exists in THIS Stripe account
+    if (customerId) {
+      try {
+        const existingCustomer = await stripe.customers.retrieve(customerId);
+
+        if (!existingCustomer || existingCustomer.deleted) {
+          customerId = null;
+        }
+      } catch (err) {
+        const msg = err?.raw?.message || err?.message || '';
+        console.warn('Stored stripeCustomerId is invalid for current Stripe account:', {
+          userId,
+          customerId,
+          message: msg,
+        });
+        customerId = null;
+      }
+    }
+
+    // Create a fresh Stripe customer if needed
     if (!customerId) {
       const customer = await stripe.customers.create({
         metadata: { peerfundUserId: userId },
         name: user.name || undefined,
         email: user.email || undefined,
       });
+
       customerId = customer.id;
 
       await prisma.user.update({
@@ -38,7 +58,7 @@ exports.createCardSetupIntent = async (req, res) => {
         data: { stripeCustomerId: customerId },
       });
 
-      console.log('Stripe customer created:', {
+      console.log('Stripe customer created/refreshed:', {
         userId,
         customerId,
       });
@@ -55,7 +75,6 @@ exports.createCardSetupIntent = async (req, res) => {
       usage: 'off_session',
     });
 
-    // 🔍 Debug: confirm exactly what was created
     console.log('SetupIntent created:', {
       id: si.id,
       livemode: si.livemode,
@@ -66,7 +85,7 @@ exports.createCardSetupIntent = async (req, res) => {
     return res.json({ clientSecret: si.client_secret });
   } catch (err) {
     console.error('createCardSetupIntent error:', err);
-    return res.status(500).json({ error: err?.message || 'Failed to create card setup intent' });
+    return res.status(500).json({ error: err?.raw?.message || err?.message || 'Failed to create card setup intent' });
   }
 };
 
@@ -92,19 +111,16 @@ exports.setFundingPaymentMethod = async (req, res) => {
 
     let pm = await stripe.paymentMethods.retrieve(paymentMethodId);
 
-    // If PM is attached to another customer, block it
     if (pm.customer && pm.customer !== user.stripeCustomerId) {
       return res.status(400).json({ error: 'Payment method belongs to another customer' });
     }
 
-    // If PM is not attached yet, attach it
     if (!pm.customer) {
       pm = await stripe.paymentMethods.attach(paymentMethodId, {
         customer: user.stripeCustomerId,
       });
     }
 
-    // Save as default invoice payment method on Stripe customer too
     await stripe.customers.update(user.stripeCustomerId, {
       invoice_settings: {
         default_payment_method: paymentMethodId,
@@ -140,7 +156,7 @@ exports.setFundingPaymentMethod = async (req, res) => {
     });
   } catch (err) {
     console.error('setFundingPaymentMethod error:', err);
-    return res.status(500).json({ error: err?.message || 'Failed to save funding card' });
+    return res.status(500).json({ error: err?.raw?.message || err?.message || 'Failed to save funding card' });
   }
 };
 
