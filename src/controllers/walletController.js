@@ -111,7 +111,7 @@ exports.depositFromFundingCard = async (req, res) => {
 
     const wallet = await getWalletOrCreate(userId);
 
-    // Create + confirm PaymentIntent using saved funding method
+    // 1) Charge the saved funding card
     const pi = await stripe.paymentIntents.create({
       amount: amountCents,
       currency: 'usd',
@@ -133,30 +133,36 @@ exports.depositFromFundingCard = async (req, res) => {
       });
     }
 
-    // Credit wallet balance
-    const updatedWallet = await prisma.wallet.update({
-      where: { id: wallet.id },
-      data: {
-        availableCents: { increment: amountCents },
-      },
-    });
-
-    // Write ledger row using the actual post-deposit balance
-    await prisma.walletLedger.create({
-      data: {
-        walletId: wallet.id,
-        type: 'DEPOSIT',
-        amountCents,
-        direction: 'CREDIT',
-        balanceAfterCents: updatedWallet.availableCents,
-        referenceType: 'StripePI',
-        referenceId: pi.id,
-        metadata: {
-          externalId: pi.id,
-          provider: 'stripe',
-          status: pi.status,
+    // 2) Update wallet + ledger atomically
+    const updatedWallet = await prisma.$transaction(async (tx) => {
+      const updated = await tx.wallet.update({
+        where: { id: wallet.id },
+        data: {
+          availableCents: { increment: amountCents },
         },
-      },
+      });
+
+      await tx.walletLedger.create({
+        data: {
+          walletId: wallet.id,
+          type: 'DEPOSIT',
+          amountCents,
+          direction: 'CREDIT',
+          balanceAfterCents: updated.availableCents,
+          referenceType: 'StripePI',
+          // Do NOT store pi.id in referenceId if that field expects ObjectId/other constrained format
+          referenceId: null,
+          metadata: {
+            externalId: pi.id,
+            provider: 'stripe',
+            status: pi.status,
+            customerId: user.stripeCustomerId,
+            paymentMethodId: user.fundingPaymentMethodId,
+          },
+        },
+      });
+
+      return updated;
     });
 
     return res.json({
