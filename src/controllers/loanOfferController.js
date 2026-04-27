@@ -196,6 +196,24 @@ exports.acceptLoanOffer = async (req, res) => {
         .json({ error: 'Offer has invalid amount' });
     }
 
+    // Require borrower to have a saved Wallet funding card for future repayments
+    const borrowerFunding = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        stripeCustomerId: true,
+        fundingPaymentMethodId: true,
+        fundingCardLast4: true,
+        fundingCardBrand: true,
+      },
+    });
+
+    if (!borrowerFunding?.stripeCustomerId || !borrowerFunding?.fundingPaymentMethodId) {
+      return res.status(400).json({
+        error: 'Please save a funding card in your Wallet before accepting this loan.',
+        code: 'MISSING_WALLET_FUNDING_CARD',
+      });
+    }
+
     // Make sure we don't already have a loan for this request
     const existingLoan = await prisma.loan.findFirst({
       where: { loanRequestId: offer.loanRequestId },
@@ -219,17 +237,21 @@ exports.acceptLoanOffer = async (req, res) => {
     const repaymentPeerfundEach = offer.lender.isSuperUser
       ? 0
       : r2(baseMonthlyPayment * PEERFUND_FEE_RATE);
+
     const repaymentBankingEach = r2(
       baseMonthlyPayment * BANKING_FEE_RATE
     );
 
     const scheduleRows = [];
     let due = new Date();
+
     for (let i = 0; i < Number(offer.duration); i++) {
       due.setMonth(due.getMonth() + 1);
+
       const totalCharged = r2(
         baseMonthlyPayment + repaymentBankingEach + repaymentPeerfundEach
       );
+
       scheduleRows.push({
         loanId: '', // will be filled in after create
         dueDate: new Date(due),
@@ -342,6 +364,7 @@ Accepted At: ${acceptanceTimestamp.toISOString()}`;
         ...r,
         loanId: created.id,
       }));
+
       await tx.repayment.createMany({ data: rowsWithLoanId });
 
       return created;
