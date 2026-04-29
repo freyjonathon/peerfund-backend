@@ -2,6 +2,7 @@
 const prisma = require('../utils/prisma');
 const { getWalletOrCreate } = require('../utils/wallet');
 const { getUserId } = require('../middleware/authMiddleware');
+const { stripe, getConnectAccount } = require('../lib/stripeIdentities');
 
 const stripeSecret = process.env.STRIPE_SECRET_KEY || '';
 const stripe = stripeSecret ? require('stripe')(stripeSecret) : null;
@@ -204,7 +205,9 @@ exports.depositFromFundingCard = async (req, res) => {
 exports.withdrawFunds = async (req, res) => {
   try {
     const userId = getUserId(req);
-    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+    if (!userId) {
+      return res.status(401).json({ ok: false, error: 'Unauthorized' });
+    }
 
     const { amountDollars } = req.body || {};
     const dollars = Number(amountDollars);
@@ -217,36 +220,102 @@ exports.withdrawFunds = async (req, res) => {
     }
 
     const amountCents = Math.round(dollars * 100);
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        stripeAccountId: true,
+        connectOnboardingCompleted: true,
+      },
+    });
+
+    if (!user?.stripeAccountId) {
+      return res.status(400).json({
+        ok: false,
+        code: 'CONNECT_ACCOUNT_REQUIRED',
+        error: 'Please complete payout setup before withdrawing funds.',
+      });
+    }
+
+    const acct = await getConnectAccount(user.stripeAccountId);
+
+    if (!acct) {
+      return res.status(400).json({
+        ok: false,
+        code: 'CONNECT_ACCOUNT_NOT_FOUND',
+        error: 'Your payout account could not be found. Please restart payout setup.',
+      });
+    }
+
+    if (!acct.details_submitted) {
+      return res.status(400).json({
+        ok: false,
+        code: 'CONNECT_ONBOARDING_INCOMPLETE',
+        error: 'Please finish Stripe payout onboarding before withdrawing funds.',
+      });
+    }
+
+    if (!acct.payouts_enabled) {
+      return res.status(400).json({
+        ok: false,
+        code: 'PAYOUTS_NOT_ENABLED',
+        error: 'Your payout account is not ready for payouts yet. Please check your Stripe onboarding status.',
+        requirements_due: acct.requirements?.currently_due || [],
+      });
+    }
+
     const wallet = await getWalletOrCreate(userId);
 
     if (wallet.availableCents < amountCents) {
       return res.status(400).json({
         ok: false,
         error: 'Insufficient wallet balance for withdrawal',
+        availableCents: wallet.availableCents,
+        requiredCents: amountCents,
       });
     }
 
-    const updatedWallet = await prisma.wallet.update({
-      where: { id: wallet.id },
-      data: {
-        availableCents: { decrement: amountCents },
+    // Send funds from PeerFund platform balance to user's connected account.
+    // Stripe IDs are stored in metadata, NOT referenceId, because referenceId is ObjectId in Prisma.
+    const transfer = await stripe.transfers.create({
+      amount: amountCents,
+      currency: 'usd',
+      destination: user.stripeAccountId,
+      metadata: {
+        userId,
+        walletId: wallet.id,
+        purpose: 'wallet_withdrawal',
       },
     });
 
-    await prisma.walletLedger.create({
-      data: {
-        walletId: wallet.id,
-        type: 'WITHDRAWAL',
-        amountCents,
-        direction: 'DEBIT',
-        balanceAfterCents: updatedWallet.availableCents,
-        referenceType: 'ManualPayout',
-        referenceId: null,
-        metadata: {
-          status: 'COMPLETED',
-          provider: stripe ? 'stripe' : 'simulated',
+    const updatedWallet = await prisma.$transaction(async (tx) => {
+      const updated = await tx.wallet.update({
+        where: { id: wallet.id },
+        data: {
+          availableCents: { decrement: amountCents },
         },
-      },
+      });
+
+      await tx.walletLedger.create({
+        data: {
+          walletId: wallet.id,
+          type: 'WITHDRAWAL',
+          amountCents,
+          direction: 'DEBIT',
+          balanceAfterCents: updated.availableCents,
+          referenceType: 'StripeTransfer',
+          referenceId: null,
+          metadata: {
+            provider: 'stripe',
+            status: 'TRANSFER_CREATED',
+            transferId: transfer.id,
+            destinationAccountId: user.stripeAccountId,
+          },
+        },
+      });
+
+      return updated;
     });
 
     return res.json({
@@ -255,12 +324,17 @@ exports.withdrawFunds = async (req, res) => {
       pendingCents: updatedWallet.pendingCents,
       available: updatedWallet.availableCents / 100,
       pending: updatedWallet.pendingCents / 100,
+      transferId: transfer.id,
     });
   } catch (err) {
     console.error('withdrawFunds error:', err);
+
     return res.status(500).json({
       ok: false,
-      error: err?.message || 'Failed to withdraw funds',
+      error:
+        err?.raw?.message ||
+        err?.message ||
+        'Failed to withdraw funds',
     });
   }
 };
