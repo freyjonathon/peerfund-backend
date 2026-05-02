@@ -231,6 +231,108 @@ exports.createBankSetupIntent = async (req, res) => {
   }
 };
 
+/**
+ * POST /api/stripe/save-ach-payment-method
+ * Body: { paymentMethodId }
+ *
+ * Saves a us_bank_account PaymentMethod as the user's default ACH charge method
+ * for wallet ACH deposits.
+ */
+exports.saveAchPaymentMethod = async (req, res) => {
+  try {
+    const me = await getMe(req);
+    if (!me) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { paymentMethodId } = req.body || {};
+    if (!paymentMethodId) {
+      return res.status(400).json({ error: 'Missing paymentMethodId' });
+    }
+
+    const customerId = await ensureStripeCustomerFor(prisma, me);
+
+    let pm = await stripe.paymentMethods.retrieve(paymentMethodId);
+
+    if (!pm || pm.type !== 'us_bank_account') {
+      return res.status(400).json({ error: 'Invalid payment method type' });
+    }
+
+    if (pm.customer && pm.customer !== customerId) {
+      return res.status(400).json({
+        error: 'Payment method belongs to another Stripe customer',
+      });
+    }
+
+    if (!pm.customer) {
+      pm = await stripe.paymentMethods.attach(paymentMethodId, {
+        customer: customerId,
+      });
+    }
+
+    const bank = pm.us_bank_account || {};
+    const last4 = bank.last4 || null;
+    const bankName = bank.bank_name || null;
+    const accountType = bank.account_type || null;
+    const fingerprint = bank.fingerprint || null;
+
+    await prisma.paymentMethod.updateMany({
+      where: {
+        userId: me.id,
+        type: 'US_BANK',
+        isDefaultCharge: true,
+      },
+      data: {
+        isDefaultCharge: false,
+        isDefault: false,
+      },
+    });
+
+    const saved = await prisma.paymentMethod.upsert({
+      where: { stripePaymentMethodId: paymentMethodId },
+      update: {
+        stripeCustomerId: customerId,
+        type: 'US_BANK',
+        brand: bankName || 'us_bank_account',
+        last4,
+        bankName,
+        accountType,
+        bankFingerprint: fingerprint,
+        status: 'ACTIVE',
+        isDefaultCharge: true,
+        isDefault: true,
+        isForLoans: false,
+      },
+      create: {
+        userId: me.id,
+        stripePaymentMethodId: paymentMethodId,
+        stripeCustomerId: customerId,
+        type: 'US_BANK',
+        brand: bankName || 'us_bank_account',
+        last4,
+        bankName,
+        accountType,
+        bankFingerprint: fingerprint,
+        status: 'ACTIVE',
+        isDefaultCharge: true,
+        isDefault: true,
+        isForLoans: false,
+      },
+    });
+
+    return res.json({
+      ok: true,
+      paymentMethodId: saved.stripePaymentMethodId,
+      last4,
+      bankName,
+      accountType,
+    });
+  } catch (err) {
+    console.error('saveAchPaymentMethod error', err);
+    return res.status(500).json({
+      error: err?.raw?.message || err?.message || 'Failed to save ACH payment method',
+    });
+  }
+};
+
 /* ================================================================== */
 /*  Loan funding: store borrower’s receiving bank (PaymentMethod)      */
 /* ================================================================== */

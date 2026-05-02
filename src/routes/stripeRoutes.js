@@ -8,6 +8,7 @@ const connectCtl = require('../controllers/stripeConnectController');
 // ─ Borrower = Stripe Customer (wallet / repayments) ─
 router.post('/ensure-customer', authenticateToken, connectCtl.ensureCustomer);
 router.post('/create-bank-setup-intent', authenticateToken, connectCtl.createBankSetupIntent);
+router.post('/save-ach-payment-method', authenticateToken, connectCtl.saveAchPaymentMethod);
 
 // ─ Payouts = Connect Account ─
 router.post('/ensure-connect-account', authenticateToken, connectCtl.ensureConnectAccount);
