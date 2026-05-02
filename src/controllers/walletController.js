@@ -39,16 +39,177 @@ exports.getMyWallet = async (req, res) => {
 };
 
 /**
- * LEGACY: Stripe webhook
+ * POST /api/wallet/webhook/stripe
+ *
+ * Finalizes ACH wallet deposits:
+ * - payment_intent.succeeded: pendingCents -> availableCents
+ * - payment_intent.payment_failed: removes pendingCents
  */
-exports.stripeWebhook = async (_req, res) => {
+exports.stripeWebhook = async (req, res) => {
   if (!stripe) return res.status(501).send('Stripe not configured');
 
+  const sig = req.headers['stripe-signature'];
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  let event;
+
   try {
+    event = stripe.webhooks.constructEvent(req.rawBody || req.body, sig, secret);
+    console.log('✅ Wallet Stripe webhook:', event.type);
+  } catch (err) {
+    console.error('❌ Wallet webhook signature failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    const pi = event.data.object;
+
+    if (
+      event.type !== 'payment_intent.succeeded' &&
+      event.type !== 'payment_intent.payment_failed'
+    ) {
+      return res.json({ received: true });
+    }
+
+    if (pi.metadata?.purpose !== 'wallet_deposit_ach') {
+      return res.json({ received: true });
+    }
+
+    const walletId = pi.metadata?.walletId;
+    const netCents = Number(pi.metadata?.netCents || 0);
+
+    if (!walletId || !Number.isInteger(netCents) || netCents <= 0) {
+      console.warn('Wallet ACH webhook missing walletId/netCents', {
+        walletId,
+        netCents,
+        paymentIntentId: pi.id,
+      });
+      return res.json({ received: true });
+    }
+
+    const wallet = await prisma.wallet.findUnique({
+      where: { id: walletId },
+    });
+
+    if (!wallet) {
+      console.warn('Wallet not found for ACH webhook', { walletId, paymentIntentId: pi.id });
+      return res.json({ received: true });
+    }
+
+    // Find the original pending ledger row.
+    // Because metadata is Json, safest approach is to pull recent StripePI rows and filter in JS.
+    const recentLedgers = await prisma.walletLedger.findMany({
+      where: {
+        walletId,
+        type: 'DEPOSIT',
+        referenceType: 'StripePI',
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    });
+
+    const pendingLedger = recentLedgers.find((row) => {
+      const meta = row.metadata || {};
+      return (
+        meta.externalId === pi.id &&
+        meta.method === 'ach' &&
+        meta.pending === true
+      );
+    });
+
+    if (!pendingLedger) {
+      console.log('ACH deposit already finalized or pending ledger not found', {
+        paymentIntentId: pi.id,
+        walletId,
+      });
+      return res.json({ received: true });
+    }
+
+    if (event.type === 'payment_intent.succeeded') {
+      await prisma.$transaction(async (tx) => {
+        const currentWallet = await tx.wallet.findUnique({
+          where: { id: walletId },
+        });
+
+        if (!currentWallet) throw new Error('Wallet disappeared during ACH settlement');
+
+        const pendingDecrement = Math.min(currentWallet.pendingCents, netCents);
+        const newAvailable = currentWallet.availableCents + netCents;
+
+        await tx.wallet.update({
+          where: { id: walletId },
+          data: {
+            pendingCents: { decrement: pendingDecrement },
+            availableCents: { increment: netCents },
+          },
+        });
+
+        await tx.walletLedger.update({
+          where: { id: pendingLedger.id },
+          data: {
+            balanceAfterCents: newAvailable,
+            metadata: {
+              ...(pendingLedger.metadata || {}),
+              pending: false,
+              status: 'ACH_SETTLED',
+              settledAt: new Date().toISOString(),
+              stripeStatus: pi.status,
+            },
+          },
+        });
+      });
+
+      console.log('✅ ACH wallet deposit settled', {
+        paymentIntentId: pi.id,
+        walletId,
+        netCents,
+      });
+    }
+
+    if (event.type === 'payment_intent.payment_failed') {
+      await prisma.$transaction(async (tx) => {
+        const currentWallet = await tx.wallet.findUnique({
+          where: { id: walletId },
+        });
+
+        if (!currentWallet) throw new Error('Wallet disappeared during ACH failure');
+
+        const pendingDecrement = Math.min(currentWallet.pendingCents, netCents);
+
+        await tx.wallet.update({
+          where: { id: walletId },
+          data: {
+            pendingCents: { decrement: pendingDecrement },
+          },
+        });
+
+        await tx.walletLedger.update({
+          where: { id: pendingLedger.id },
+          data: {
+            metadata: {
+              ...(pendingLedger.metadata || {}),
+              pending: false,
+              status: 'ACH_FAILED',
+              failedAt: new Date().toISOString(),
+              stripeStatus: pi.status,
+              failureMessage:
+                pi.last_payment_error?.message || 'ACH payment failed',
+            },
+          },
+        });
+      });
+
+      console.log('⚠️ ACH wallet deposit failed', {
+        paymentIntentId: pi.id,
+        walletId,
+        netCents,
+      });
+    }
+
     return res.json({ received: true });
   } catch (err) {
-    console.error('stripeWebhook error:', err);
-    return res.status(500).send('Internal webhook error');
+    console.error('❌ Wallet webhook handler error:', err);
+    return res.status(500).send('Wallet webhook handler error');
   }
 };
 
