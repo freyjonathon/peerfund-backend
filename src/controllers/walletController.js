@@ -3,9 +3,10 @@ const prisma = require('../utils/prisma');
 const { getWalletOrCreate } = require('../utils/wallet');
 const { getUserId } = require('../middleware/authMiddleware');
 const { stripe, getConnectAccount } = require('../lib/stripeIdentities');
-
-const stripeSecret = process.env.STRIPE_SECRET_KEY || '';
-const stripe = stripeSecret ? require('stripe')(stripeSecret) : null;
+const {
+  dollarsToCents,
+  grossUpForCardDeposit,
+} = require('../utils/fees');
 
 /**
  * GET /api/wallet/me
@@ -38,11 +39,10 @@ exports.getMyWallet = async (req, res) => {
 
 /**
  * LEGACY: Stripe webhook
- * Wallet crediting is done immediately after a successful PaymentIntent,
- * so this can remain a no-op for now.
  */
 exports.stripeWebhook = async (_req, res) => {
   if (!stripe) return res.status(501).send('Stripe not configured');
+
   try {
     return res.json({ received: true });
   } catch (err) {
@@ -62,11 +62,12 @@ exports.devConfirmDeposit = async (_req, res) => {
  * POST /api/wallet/deposit
  * Body: { amountDollars }
  *
- * Real money flow:
- *  - Uses the user's saved funding card
- *  - Creates and confirms a Stripe PaymentIntent server-side
- *  - On success, credits wallet.availableCents
- *  - Writes a DEPOSIT ledger row
+ * Real card deposit flow:
+ * - User chooses amount to add to wallet
+ * - Backend grosses up charge so user pays Stripe + PeerFund deposit fees
+ * - Stripe charges gross amount
+ * - Wallet receives net amount only
+ * - Fee breakdown is stored in ledger metadata
  */
 exports.depositFromFundingCard = async (req, res) => {
   try {
@@ -85,7 +86,8 @@ exports.depositFromFundingCard = async (req, res) => {
       });
     }
 
-    const amountCents = Math.round(dollars * 100);
+    const amountCents = dollarsToCents(dollars);
+    const feeBreakdown = grossUpForCardDeposit(amountCents);
 
     if (!stripe) {
       return res.status(500).json({
@@ -112,9 +114,9 @@ exports.depositFromFundingCard = async (req, res) => {
 
     const wallet = await getWalletOrCreate(userId);
 
-    // 1) Charge the saved funding card
+    // 1) Charge the saved funding card for gross amount
     const pi = await stripe.paymentIntents.create({
-      amount: amountCents,
+      amount: feeBreakdown.grossCents,
       currency: 'usd',
       customer: user.stripeCustomerId,
       payment_method: user.fundingPaymentMethodId,
@@ -124,6 +126,13 @@ exports.depositFromFundingCard = async (req, res) => {
         userId,
         walletId: wallet.id,
         purpose: 'wallet_deposit',
+
+        // Fee details
+        netCents: String(feeBreakdown.netCents),
+        grossCents: String(feeBreakdown.grossCents),
+        estimatedStripeFeeCents: String(feeBreakdown.estimatedStripeFeeCents),
+        peerfundFeeCents: String(feeBreakdown.peerfundFeeCents),
+        totalFeeCents: String(feeBreakdown.totalFeeCents),
       },
     });
 
@@ -134,12 +143,12 @@ exports.depositFromFundingCard = async (req, res) => {
       });
     }
 
-    // 2) Update wallet + ledger atomically
+    // 2) Credit wallet with NET deposit amount only
     const updatedWallet = await prisma.$transaction(async (tx) => {
       const updated = await tx.wallet.update({
         where: { id: wallet.id },
         data: {
-          availableCents: { increment: amountCents },
+          availableCents: { increment: feeBreakdown.netCents },
         },
       });
 
@@ -147,11 +156,10 @@ exports.depositFromFundingCard = async (req, res) => {
         data: {
           walletId: wallet.id,
           type: 'DEPOSIT',
-          amountCents,
+          amountCents: feeBreakdown.netCents,
           direction: 'CREDIT',
           balanceAfterCents: updated.availableCents,
           referenceType: 'StripePI',
-          // Do NOT store pi.id in referenceId if that field expects ObjectId/other constrained format
           referenceId: null,
           metadata: {
             externalId: pi.id,
@@ -159,6 +167,12 @@ exports.depositFromFundingCard = async (req, res) => {
             status: pi.status,
             customerId: user.stripeCustomerId,
             paymentMethodId: user.fundingPaymentMethodId,
+
+            netCents: feeBreakdown.netCents,
+            grossCents: feeBreakdown.grossCents,
+            estimatedStripeFeeCents: feeBreakdown.estimatedStripeFeeCents,
+            peerfundFeeCents: feeBreakdown.peerfundFeeCents,
+            totalFeeCents: feeBreakdown.totalFeeCents,
           },
         },
       });
@@ -173,6 +187,13 @@ exports.depositFromFundingCard = async (req, res) => {
       available: updatedWallet.availableCents / 100,
       pending: updatedWallet.pendingCents / 100,
       paymentIntentId: pi.id,
+      deposit: {
+        netCents: feeBreakdown.netCents,
+        grossCents: feeBreakdown.grossCents,
+        estimatedStripeFeeCents: feeBreakdown.estimatedStripeFeeCents,
+        peerfundFeeCents: feeBreakdown.peerfundFeeCents,
+        totalFeeCents: feeBreakdown.totalFeeCents,
+      },
     });
   } catch (err) {
     console.error('depositFromFundingCard error:', err);
@@ -193,14 +214,11 @@ exports.depositFromFundingCard = async (req, res) => {
  * POST /api/wallet/withdraw
  * Body: { amountDollars }
  *
- * For now:
- *  - validates amount
- *  - checks wallet balance
- *  - decrements availableCents
- *  - writes a ledger row
- *
- * This does NOT yet push real money back to a bank/card.
- * It only updates the in-app wallet.
+ * Real withdrawal flow:
+ * - Requires user's Stripe Connect payout account
+ * - Creates Stripe transfer from PeerFund platform to connected account
+ * - Debits wallet available balance
+ * - Stores Stripe transfer ID in metadata, not referenceId
  */
 exports.withdrawFunds = async (req, res) => {
   try {
@@ -219,7 +237,7 @@ exports.withdrawFunds = async (req, res) => {
       });
     }
 
-    const amountCents = Math.round(dollars * 100);
+    const amountCents = dollarsToCents(dollars);
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
@@ -260,7 +278,8 @@ exports.withdrawFunds = async (req, res) => {
       return res.status(400).json({
         ok: false,
         code: 'PAYOUTS_NOT_ENABLED',
-        error: 'Your payout account is not ready for payouts yet. Please check your Stripe onboarding status.',
+        error:
+          'Your payout account is not ready for payouts yet. Please check your Stripe onboarding status.',
         requirements_due: acct.requirements?.currently_due || [],
       });
     }
@@ -276,8 +295,7 @@ exports.withdrawFunds = async (req, res) => {
       });
     }
 
-    // Send funds from PeerFund platform balance to user's connected account.
-    // Stripe IDs are stored in metadata, NOT referenceId, because referenceId is ObjectId in Prisma.
+    // 1) Send funds from PeerFund platform balance to user's connected account
     const transfer = await stripe.transfers.create({
       amount: amountCents,
       currency: 'usd',
@@ -289,6 +307,7 @@ exports.withdrawFunds = async (req, res) => {
       },
     });
 
+    // 2) Debit wallet after Stripe transfer creation succeeds
     const updatedWallet = await prisma.$transaction(async (tx) => {
       const updated = await tx.wallet.update({
         where: { id: wallet.id },
