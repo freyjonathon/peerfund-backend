@@ -1,95 +1,190 @@
 // src/controllers/repaymentController.js
 const prisma = require('../utils/prisma');
-const { PEERFUND_FEE_RATE, BANKING_FEE_RATE, calcFees } = require('../utils/fees');
+const {
+  PEERFUND_FEE_RATE,
+  BANKING_FEE_RATE,
+  calcFees,
+  STRIPE_CARD_PERCENT = 0.029,
+  STRIPE_CARD_FIXED_CENTS = 30,
+} = require('../utils/fees');
 const { WalletEntryType } = require('@prisma/client');
 const { getWalletOrCreate } = require('../utils/wallet');
+const { stripe } = require('../lib/stripeIdentities');
 
-// Platform user that receives platform + bank fees
 const PLATFORM_USER_ID =
   process.env.PLATFORM_FEE_USER_ID || '68f523b619356751fcb1ed4b';
 
-// helper: round to 2 decimals
 const r2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
-// helper: push repayment money into wallets (lender + platform)
-async function applyWalletCreditsForRepayment({ loan, loanId, base, bankingFee, platformFee }) {
-  try {
-    const lenderId = loan?.lender?.id;
+const dollarsToCents = (n) => Math.round(Number(n || 0) * 100);
 
-    console.log('💸 applyWalletCreditsForRepayment', {
-      loanId,
-      lenderId,
-      base,
-      bankingFee,
-      platformFee,
+function grossUpForStripeCard(netCents) {
+  const grossCents = Math.ceil(
+    (netCents + STRIPE_CARD_FIXED_CENTS) / (1 - STRIPE_CARD_PERCENT)
+  );
+
+  const estimatedStripeFeeCents = Math.ceil(
+    grossCents * STRIPE_CARD_PERCENT + STRIPE_CARD_FIXED_CENTS
+  );
+
+  return {
+    netCents,
+    grossCents,
+    estimatedStripeFeeCents,
+    totalFeeCents: grossCents - netCents,
+  };
+}
+
+async function applyWalletCreditsForRepaymentTx(tx, { loan, loanId, base, bankingFee, platformFee }) {
+  const lenderId = loan?.lender?.id || loan?.lenderId;
+
+  const baseCents = dollarsToCents(base);
+  const bankCents = dollarsToCents(bankingFee);
+  const platformCents = dollarsToCents(platformFee);
+  const totalFeeCents = bankCents + platformCents;
+
+  if (lenderId && baseCents > 0) {
+    const lenderWallet = await tx.wallet.upsert({
+      where: { userId: lenderId },
+      update: {},
+      create: {
+        userId: lenderId,
+        availableCents: 0,
+        pendingCents: 0,
+      },
     });
 
-    const baseCents     = Math.round((Number(base)        || 0) * 100);
-    const bankCents     = Math.round((Number(bankingFee)  || 0) * 100);
-    const platformCents = Math.round((Number(platformFee) || 0) * 100);
-    const totalFeeCents = bankCents + platformCents;
+    const newBal = lenderWallet.availableCents + baseCents;
 
-    // 1) Credit lender wallet with base repayment
-    if (lenderId && baseCents > 0) {
-      const lenderWallet = await getWalletOrCreate(lenderId);
-      const newBal = (lenderWallet.availableCents || 0) + baseCents;
+    await tx.wallet.update({
+      where: { id: lenderWallet.id },
+      data: { availableCents: newBal },
+    });
 
-      await prisma.wallet.update({
-        where: { id: lenderWallet.id },
-        data: { availableCents: newBal },
-      });
-
-      await prisma.walletLedger.create({
-        data: {
-          walletId: lenderWallet.id,
-          type: WalletEntryType.DISBURSE, // reuse DISBURSE for loan-related inflow
-          amountCents: baseCents,
-          direction: 'CREDIT',
-          balanceAfterCents: newBal,
-          referenceType: 'Loan',
-          referenceId: loanId,
-          metadata: {
-            loanId,
-            reason: 'REPAYMENT_BASE',
-          },
+    await tx.walletLedger.create({
+      data: {
+        walletId: lenderWallet.id,
+        type: WalletEntryType.DISBURSE,
+        amountCents: baseCents,
+        direction: 'CREDIT',
+        balanceAfterCents: newBal,
+        referenceType: 'Loan',
+        referenceId: loanId,
+        metadata: {
+          loanId,
+          reason: 'REPAYMENT_BASE',
         },
-      });
-    }
+      },
+    });
+  }
 
-    // 2) Credit platform wallet with BANK_FEE + PLATFORM_FEE
-    if (PLATFORM_USER_ID && totalFeeCents > 0) {
-      const platformWallet = await getWalletOrCreate(PLATFORM_USER_ID);
-      const newBal = (platformWallet.availableCents || 0) + totalFeeCents;
+  if (PLATFORM_USER_ID && totalFeeCents > 0) {
+    const platformWallet = await tx.wallet.upsert({
+      where: { userId: PLATFORM_USER_ID },
+      update: {},
+      create: {
+        userId: PLATFORM_USER_ID,
+        availableCents: 0,
+        pendingCents: 0,
+      },
+    });
 
-      await prisma.wallet.update({
-        where: { id: platformWallet.id },
-        data: { availableCents: newBal },
-      });
+    const newBal = platformWallet.availableCents + totalFeeCents;
 
-      await prisma.walletLedger.create({
-        data: {
-          walletId: platformWallet.id,
-          type: WalletEntryType.ADJUSTMENT, // generic “system” credit
-          amountCents: totalFeeCents,
-          direction: 'CREDIT',
-          balanceAfterCents: newBal,
-          referenceType: 'Loan',
-          referenceId: loanId,
-          metadata: {
-            loanId,
-            reason: 'REPAYMENT_FEES',
-            bankCents,
-            platformCents,
-          },
+    await tx.wallet.update({
+      where: { id: platformWallet.id },
+      data: { availableCents: newBal },
+    });
+
+    await tx.walletLedger.create({
+      data: {
+        walletId: platformWallet.id,
+        type: WalletEntryType.ADJUSTMENT,
+        amountCents: totalFeeCents,
+        direction: 'CREDIT',
+        balanceAfterCents: newBal,
+        referenceType: 'Loan',
+        referenceId: loanId,
+        metadata: {
+          loanId,
+          reason: 'REPAYMENT_FEES',
+          bankCents,
+          platformCents,
         },
-      });
-    }
-  } catch (e) {
-    console.error('⚠️ Failed to apply wallet credits for repayment:', e);
+      },
+    });
   }
 }
 
-// GET /api/repayments/:loanId – List repayments
+async function createRepaymentAccountingTx(tx, {
+  loan,
+  loanId,
+  repaymentId,
+  base,
+  finalBanking,
+  finalPeerfund,
+}) {
+  const txRows = [];
+
+  if (loan.lender?.id && base > 0) {
+    txRows.push({
+      type: 'REPAYMENT',
+      amount: r2(base),
+      fromUserId: loan.borrowerId,
+      toUserId: loan.lender.id,
+      loanId,
+    });
+  }
+
+  if (finalBanking > 0) {
+    txRows.push({
+      type: 'BANK_FEE',
+      amount: r2(finalBanking),
+      fromUserId: loan.borrowerId,
+      toUserId: PLATFORM_USER_ID,
+      loanId,
+    });
+  }
+
+  if (finalPeerfund > 0) {
+    txRows.push({
+      type: 'PLATFORM_FEE',
+      amount: r2(finalPeerfund),
+      fromUserId: loan.borrowerId,
+      toUserId: PLATFORM_USER_ID,
+      loanId,
+    });
+  }
+
+  if (txRows.length) {
+    await tx.transaction.createMany({ data: txRows });
+  }
+
+  const feeRecords = [];
+
+  if (finalBanking > 0) {
+    feeRecords.push({
+      loanId,
+      repaymentId,
+      type: 'BANK_FEE',
+      amount: r2(finalBanking),
+    });
+  }
+
+  if (finalPeerfund > 0) {
+    feeRecords.push({
+      loanId,
+      repaymentId,
+      type: 'PLATFORM_FEE',
+      amount: r2(finalPeerfund),
+    });
+  }
+
+  if (feeRecords.length) {
+    await tx.fee.createMany({ data: feeRecords });
+  }
+}
+
 exports.getLoanRepayments = async (req, res) => {
   const { loanId } = req.params;
 
@@ -106,7 +201,6 @@ exports.getLoanRepayments = async (req, res) => {
   }
 };
 
-// PUT /api/repayments/record/:repaymentId – Manual entry (admin/testing)
 exports.recordRepayment = async (req, res) => {
   const { repaymentId } = req.params;
   const { amountPaid } = req.body;
@@ -128,24 +222,19 @@ exports.recordRepayment = async (req, res) => {
   }
 };
 
-/**
- * POST /api/repayments/:loanId
- * Borrower makes a payment for the NEXT pending installment (manual amount path)
- */
 exports.makeRepayment = async (req, res) => {
   const userId = req.user.userId;
   const { loanId } = req.params;
   const { amount } = req.body;
 
   try {
-    // NOTE: use select so Prisma does NOT try to load interestRateBps/principalCents
     const loan = await prisma.loan.findUnique({
       where: { id: loanId },
       select: {
         id: true,
         borrowerId: true,
         borrower: { select: { id: true, isSuperUser: true } },
-        lender:   { select: { id: true } },
+        lender: { select: { id: true } },
         repayments: {
           orderBy: { dueDate: 'asc' },
           select: {
@@ -162,17 +251,15 @@ exports.makeRepayment = async (req, res) => {
     }
 
     const nextRepayment = loan.repayments.find((r) => r.status === 'PENDING');
+
     if (!nextRepayment) {
       return res.status(400).json({ error: 'No pending repayments' });
     }
 
-    // Base for this installment
     const base = Number(nextRepayment.basePayment) || 0;
 
-    // Compute fees from helper
     let { peerfundFee, bankingFee, totalFees, totalCharge } = calcFees(base);
 
-    // Super users bypass PeerFund fee
     if (loan.borrower.isSuperUser) {
       peerfundFee = 0;
       totalFees = r2(peerfundFee + bankingFee);
@@ -180,116 +267,56 @@ exports.makeRepayment = async (req, res) => {
     }
 
     const paymentAmount = Number(amount);
+
     if (!Number.isFinite(paymentAmount)) {
       return res.status(400).json({ error: 'Amount must be a number' });
     }
+
     if (paymentAmount < totalCharge) {
       return res.status(400).json({
-        error: `Minimum payment is $${totalCharge.toFixed(
-          2
-        )}. Your payment: $${paymentAmount.toFixed(2)}`,
+        error: `Minimum payment is $${totalCharge.toFixed(2)}. Your payment: $${paymentAmount.toFixed(2)}`,
       });
     }
 
-    // ── 1) Mark repayment as paid (MVP: no real gateway call yet) ─────────
     const paidAt = new Date();
-    const updated = await prisma.repayment.update({
-      where: { id: nextRepayment.id },
-      data: {
-        amountPaid: paymentAmount,
-        basePayment: base,
-        bankingFee: r2(bankingFee),
-        peerfundFee: r2(peerfundFee),
-        totalCharged: r2(totalCharge),
-        status: 'PAID',
-        paidAt,
-      },
-    });
-
-    // Normalize final fee values we’ll use for accounting
     const finalBanking = r2(bankingFee);
     const finalPeerfund = r2(peerfundFee);
 
-    // ── 2) Fee audit rows (existing fee table) ────────────────────────────
-    try {
-      const feeRecords = [];
-      if (finalBanking > 0) {
-        feeRecords.push({
-          loanId,
-          repaymentId: updated.id,
-          type: 'BANK_FEE',
-          amount: finalBanking,
-        });
-      }
-      if (finalPeerfund > 0) {
-        feeRecords.push({
-          loanId,
-          repaymentId: updated.id,
-          type: 'PLATFORM_FEE',
-          amount: finalPeerfund,
-        });
-      }
-      if (feeRecords.length) {
-        await prisma.fee.createMany({ data: feeRecords });
-      }
-    } catch (e) {
-      console.error('⚠️ Failed to log fees into fee table:', e);
-    }
+    const updated = await prisma.$transaction(async (tx) => {
+      const repayment = await tx.repayment.update({
+        where: { id: nextRepayment.id },
+        data: {
+          amountPaid: paymentAmount,
+          basePayment: base,
+          bankingFee: finalBanking,
+          peerfundFee: finalPeerfund,
+          totalCharged: r2(totalCharge),
+          status: 'PAID',
+          paidAt,
+        },
+      });
 
-    // ── 3) Transactions for history & accounting ──────────────────────────
-    try {
-      const txRows = [];
+      await createRepaymentAccountingTx(tx, {
+        loan,
+        loanId,
+        repaymentId: repayment.id,
+        base,
+        finalBanking,
+        finalPeerfund,
+      });
 
-      // a) REPAYMENT → lender (base amount only)
-      if (loan.lender?.id) {
-        txRows.push({
-          type: 'REPAYMENT',
-          amount: r2(base),
-          fromUserId: loan.borrowerId,
-          toUserId: loan.lender.id,
-          loanId,
-        });
-      }
+      await applyWalletCreditsForRepaymentTx(tx, {
+        loan,
+        loanId,
+        base,
+        bankingFee: finalBanking,
+        platformFee: finalPeerfund,
+      });
 
-      // b) BANK_FEE → platform
-      if (finalBanking > 0) {
-        txRows.push({
-          type: 'BANK_FEE',
-          amount: finalBanking,
-          fromUserId: loan.borrowerId,
-          toUserId: PLATFORM_USER_ID,
-          loanId,
-        });
-      }
-
-      // c) PLATFORM_FEE → platform
-      if (finalPeerfund > 0) {
-        txRows.push({
-          type: 'PLATFORM_FEE',
-          amount: finalPeerfund,
-          fromUserId: loan.borrowerId,
-          toUserId: PLATFORM_USER_ID,
-          loanId,
-        });
-      }
-
-      if (txRows.length) {
-        await prisma.transaction.createMany({ data: txRows });
-      }
-    } catch (e) {
-      console.error('⚠️ Failed to log repayment transactions:', e);
-    }
-
-    // ── 4) Wallet credits: lender base + platform fees ────────────────────
-    await applyWalletCreditsForRepayment({
-      loan,
-      loanId,
-      base,
-      bankingFee: finalBanking,
-      platformFee: finalPeerfund,
+      return repayment;
     });
 
-    res.status(200).json({
+    return res.status(200).json({
       message: 'Repayment submitted successfully',
       amountPaid: paymentAmount,
       breakdown: {
@@ -298,6 +325,7 @@ exports.makeRepayment = async (req, res) => {
         peerfundFee: finalPeerfund,
         total: r2(totalCharge),
       },
+      repaymentId: updated.id,
     });
   } catch (err) {
     console.error('💥 makeRepayment error:', err);
@@ -305,37 +333,45 @@ exports.makeRepayment = async (req, res) => {
   }
 };
 
-/**
- * POST /api/loans/:loanId/pay-next
- * Borrower pays the NEXT pending installment (no amount in body).
- * Body may optionally include { paymentSource: 'wallet' | 'bank' }.
- */
 exports.payNextRepayment = async (req, res) => {
   try {
     const borrowerId = req.user.userId;
     const { loanId } = req.params;
-    const { paymentSource = 'wallet' } = req.body || {}; // default wallet
+    const { paymentSource = 'wallet' } = req.body || {};
 
-    console.log('🔔 payNextRepayment called', { loanId, borrowerId, paymentSource });
+    const normalizedSource =
+      paymentSource === 'card' || paymentSource === 'funding_card'
+        ? 'card'
+        : 'wallet';
 
-    // 1) Validate borrower owns this loan – ONLY select what we actually need
+    console.log('🔔 payNextRepayment called', {
+      loanId,
+      borrowerId,
+      paymentSource: normalizedSource,
+    });
+
     const loan = await prisma.loan.findFirst({
       where: { id: loanId, borrowerId },
       select: {
         id: true,
         borrowerId: true,
         lenderId: true,
-        borrower: { select: { isSuperUser: true } },
-        lender:   { select: { id: true } },
+        borrower: {
+          select: {
+            id: true,
+            isSuperUser: true,
+            stripeCustomerId: true,
+            fundingPaymentMethodId: true,
+          },
+        },
+        lender: { select: { id: true } },
       },
     });
 
     if (!loan) {
-      console.warn('payNextRepayment: loan not found or not owned by borrower', { loanId, borrowerId });
       return res.status(404).json({ error: 'Loan not found' });
     }
 
-    // 2) Next pending repayment
     const next = await prisma.repayment.findFirst({
       where: { loanId: loan.id, status: 'PENDING' },
       orderBy: { dueDate: 'asc' },
@@ -348,160 +384,105 @@ exports.payNextRepayment = async (req, res) => {
         dueDate: true,
       },
     });
+
     if (!next) {
-      console.warn('payNextRepayment: no pending repayment', { loanId });
       return res.status(400).json({ error: 'No pending repayment' });
     }
 
-    // 3) Compute fees from base or reuse persisted values
     const base = Number(next.basePayment) || 0;
+
     let { peerfundFee, bankingFee, totalFees, totalCharge } = calcFees(base);
 
     if (loan.borrower.isSuperUser) {
       peerfundFee = 0;
-      totalFees   = r2(bankingFee + peerfundFee);
+      totalFees = r2(bankingFee + peerfundFee);
       totalCharge = r2(base + totalFees);
     }
 
     const finalPeerfund =
       typeof next.peerfundFee === 'number' ? next.peerfundFee : r2(peerfundFee);
+
     const finalBanking =
       typeof next.bankingFee === 'number' ? next.bankingFee : r2(bankingFee);
+
     const finalTotal =
-      typeof next.totalCharged === 'number'
+      typeof next.totalCharged === 'number' && next.totalCharged > 0
         ? next.totalCharged
         : r2(base + finalPeerfund + finalBanking);
 
-    console.log('💳 Computed installment amounts', {
-      base,
-      finalBanking,
-      finalPeerfund,
-      finalTotal,
-      paymentSource,
-    });
+    const finalTotalCents = dollarsToCents(finalTotal);
 
-    // 4) If paying with bank, ensure a default payment method exists
-    let paymentMethodId = null;
-    if (paymentSource === 'bank') {
-      const pm = await prisma.paymentMethod.findFirst({
-        where: { userId: borrowerId, isDefault: true },
-        select: { id: true },
+    let stripePaymentIntent = null;
+    let cardGross = null;
+
+    if (normalizedSource === 'card') {
+      if (!stripe) {
+        return res.status(500).json({ error: 'Stripe not configured' });
+      }
+
+      if (!loan.borrower?.stripeCustomerId || !loan.borrower?.fundingPaymentMethodId) {
+        return res.status(400).json({
+          error: 'No saved funding card found. Please save a funding card in your Wallet.',
+        });
+      }
+
+      cardGross = grossUpForStripeCard(finalTotalCents);
+
+      stripePaymentIntent = await stripe.paymentIntents.create({
+        amount: cardGross.grossCents,
+        currency: 'usd',
+        customer: loan.borrower.stripeCustomerId,
+        payment_method: loan.borrower.fundingPaymentMethodId,
+        off_session: true,
+        confirm: true,
+        metadata: {
+          borrowerId,
+          loanId,
+          repaymentId: next.id,
+          purpose: 'loan_repayment',
+          netRepaymentCents: String(cardGross.netCents),
+          grossChargeCents: String(cardGross.grossCents),
+          estimatedStripeFeeCents: String(cardGross.estimatedStripeFeeCents),
+        },
       });
-      if (!pm) {
-        console.warn('payNextRepayment: no default payment method for bank source', { borrowerId });
-        return res.status(400).json({ error: 'No payment method on file' });
+
+      if (stripePaymentIntent.status !== 'succeeded') {
+        return res.status(400).json({
+          error: `PaymentIntent not succeeded (status=${stripePaymentIntent.status})`,
+        });
       }
-      paymentMethodId = pm.id;
     }
 
-    // 5) CHARGE (MVP): mark repayment as paid
     const paidAt = new Date();
-    const updated = await prisma.repayment.update({
-      where: { id: next.id },
-      data: {
-        status: 'PAID',
-        paidAt,
-        basePayment: base,
-        peerfundFee: r2(finalPeerfund),
-        bankingFee: r2(finalBanking),
-        totalCharged: r2(finalTotal),
-        amountPaid: r2(finalTotal),
-      },
-      select: { id: true, status: true, paidAt: true, totalCharged: true },
-    });
 
-    // 6) Fee audit rows
-    try {
-      const feeRecords = [];
-      if (finalBanking > 0) {
-        feeRecords.push({
-          loanId,
-          repaymentId: next.id,
-          type: 'BANK_FEE',
-          amount: r2(finalBanking),
+    const result = await prisma.$transaction(async (tx) => {
+      if (normalizedSource === 'wallet') {
+        const borrowerWallet = await tx.wallet.upsert({
+          where: { userId: borrowerId },
+          update: {},
+          create: {
+            userId: borrowerId,
+            availableCents: 0,
+            pendingCents: 0,
+          },
         });
-      }
-      if (finalPeerfund > 0) {
-        feeRecords.push({
-          loanId,
-          repaymentId: next.id,
-          type: 'PLATFORM_FEE',
-          amount: r2(finalPeerfund),
-        });
-      }
-      if (feeRecords.length) {
-        await prisma.fee.createMany({ data: feeRecords });
-      }
-    } catch (e) {
-      console.error('⚠️ Failed to log fees (payNextRepayment):', e);
-    }
 
-    // 7) Transactions + wallet logic
-    try {
-      const txRows = [];
-
-      // a) REPAYMENT → lender (base amount)
-      if (loan.lender?.id && base > 0) {
-        txRows.push({
-          type: 'REPAYMENT',
-          amount: r2(base),
-          fromUserId: borrowerId,
-          toUserId:   loan.lender.id,
-          loanId,
-        });
-      }
-
-      // b) BANK_FEE → platform
-      if (finalBanking > 0) {
-        txRows.push({
-          type: 'BANK_FEE',
-          amount: r2(finalBanking),
-          fromUserId: borrowerId,
-          toUserId:   PLATFORM_USER_ID,
-          loanId,
-        });
-      }
-
-      // c) PLATFORM_FEE → platform
-      if (finalPeerfund > 0) {
-        txRows.push({
-          type: 'PLATFORM_FEE',
-          amount: r2(finalPeerfund),
-          fromUserId: borrowerId,
-          toUserId:   PLATFORM_USER_ID,
-          loanId,
-        });
-      }
-
-      if (txRows.length) {
-        await prisma.transaction.createMany({ data: txRows });
-      }
-
-      // WALLET LOGIC
-      if (paymentSource === 'wallet') {
-        const totalCents = Math.round(finalTotal * 100);
-
-        const borrowerWallet = await getWalletOrCreate(borrowerId);
-        if (!borrowerWallet || borrowerWallet.availableCents < totalCents) {
-          console.warn('payNextRepayment: insufficient wallet balance', {
-            borrowerId,
-            available: borrowerWallet?.availableCents,
-            required: totalCents,
-          });
-          return res.status(400).json({ error: 'Insufficient wallet balance' });
+        if (borrowerWallet.availableCents < finalTotalCents) {
+          throw new Error('Insufficient wallet balance');
         }
 
-        const newBorrowerBal = borrowerWallet.availableCents - totalCents;
-        await prisma.wallet.update({
+        const newBorrowerBal = borrowerWallet.availableCents - finalTotalCents;
+
+        await tx.wallet.update({
           where: { id: borrowerWallet.id },
           data: { availableCents: newBorrowerBal },
         });
 
-        await prisma.walletLedger.create({
+        await tx.walletLedger.create({
           data: {
             walletId: borrowerWallet.id,
             type: WalletEntryType.REPAYMENT,
-            amountCents: totalCents,
+            amountCents: finalTotalCents,
             direction: 'DEBIT',
             balanceAfterCents: newBorrowerBal,
             referenceType: 'Loan',
@@ -511,63 +492,85 @@ exports.payNextRepayment = async (req, res) => {
               repaymentId: next.id,
               reason: 'REPAYMENT_DEBIT',
               source: 'WALLET',
+              baseCents: dollarsToCents(base),
+              bankingFeeCents: dollarsToCents(finalBanking),
+              peerfundFeeCents: dollarsToCents(finalPeerfund),
             },
           },
         });
-
-        await applyWalletCreditsForRepayment({
-          loan,
-          loanId,
-          base,
-          bankingFee: finalBanking,
-          platformFee: finalPeerfund,
-        });
-      } else {
-        await applyWalletCreditsForRepayment({
-          loan,
-          loanId,
-          base,
-          bankingFee: finalBanking,
-          platformFee: finalPeerfund,
-        });
       }
-    } catch (e) {
-      console.error('⚠️ Failed to log repayment transactions/wallet movements:', e);
-    }
 
-    // ---------------------------------------------------------------------
-    // 8) NEW — If no pending repayments remain, mark loan as PAID_OFF
-    // ---------------------------------------------------------------------
-    try {
-      const remaining = await prisma.repayment.count({
+      const updated = await tx.repayment.update({
+        where: { id: next.id },
+        data: {
+          status: 'PAID',
+          paidAt,
+          basePayment: base,
+          peerfundFee: r2(finalPeerfund),
+          bankingFee: r2(finalBanking),
+          totalCharged: r2(finalTotal),
+          amountPaid: r2(finalTotal),
+        },
+        select: { id: true, status: true, paidAt: true, totalCharged: true },
+      });
+
+      await createRepaymentAccountingTx(tx, {
+        loan,
+        loanId,
+        repaymentId: next.id,
+        base,
+        finalBanking,
+        finalPeerfund,
+      });
+
+      await applyWalletCreditsForRepaymentTx(tx, {
+        loan,
+        loanId,
+        base,
+        bankingFee: finalBanking,
+        platformFee: finalPeerfund,
+      });
+
+      const remaining = await tx.repayment.count({
         where: { loanId, status: 'PENDING' },
       });
 
       if (remaining === 0) {
-        console.log(`🎉 Loan ${loanId} fully repaid — marking PAID_OFF`);
-        await prisma.loan.update({
+        await tx.loan.update({
           where: { id: loanId },
-          data: {
-            status: 'PAID_OFF',
-            // If you add this column later:
-            // paidOffAt: new Date(),
-          },
+          data: { status: 'PAID_OFF' },
         });
       }
-    } catch (e) {
-      console.error('⚠️ Failed to mark loan as PAID_OFF:', e);
-    }
-    // ---------------------------------------------------------------------
+
+      return updated;
+    });
 
     return res.json({
       ok: true,
-      repaymentId: updated.id,
-      status: updated.status,
-      paidAt: updated.paidAt,
-      amount: updated.totalCharged,
+      repaymentId: result.id,
+      status: result.status,
+      paidAt: result.paidAt,
+      amount: result.totalCharged,
+      paymentSource: normalizedSource,
+      stripePaymentIntentId: stripePaymentIntent?.id || null,
+      cardCharge:
+        cardGross && normalizedSource === 'card'
+          ? {
+              grossCents: cardGross.grossCents,
+              netRepaymentCents: cardGross.netCents,
+              estimatedStripeFeeCents: cardGross.estimatedStripeFeeCents,
+              totalFeeCents: cardGross.totalFeeCents,
+            }
+          : null,
     });
   } catch (err) {
     console.error('💥 payNextRepayment error:', err);
-    return res.status(500).json({ error: 'Payment failed' });
+
+    return res.status(500).json({
+      error:
+        err?.raw?.message ||
+        err?.message ||
+        'Payment failed',
+    });
   }
 };
