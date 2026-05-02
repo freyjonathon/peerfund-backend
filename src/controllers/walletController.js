@@ -6,6 +6,7 @@ const { stripe, getConnectAccount } = require('../lib/stripeIdentities');
 const {
   dollarsToCents,
   grossUpForCardDeposit,
+  grossUpForAchDeposit,
 } = require('../utils/fees');
 
 /**
@@ -206,6 +207,166 @@ exports.depositFromFundingCard = async (req, res) => {
     return res.status(500).json({
       ok: false,
       error: stripeMsg,
+    });
+  }
+};
+
+/**
+ * POST /api/wallet/deposit-ach
+ * Body: { amountDollars }
+ *
+ * ACH deposit flow:
+ * - User chooses amount to add to wallet
+ * - Backend grosses up charge so user covers ACH + PeerFund fees
+ * - Stripe charges gross amount using saved ACH PaymentMethod
+ * - Wallet gets NET amount in pendingCents first
+ * - Webhook later moves pending -> available after payment_intent.succeeded
+ */
+exports.depositFromSavedAch = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) {
+      return res.status(401).json({ ok: false, error: 'Unauthorized' });
+    }
+
+    const { amountDollars } = req.body || {};
+    const dollars = Number(amountDollars);
+
+    if (!Number.isFinite(dollars) || dollars <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Valid amountDollars is required',
+      });
+    }
+
+    if (!stripe) {
+      return res.status(500).json({
+        ok: false,
+        error: 'Stripe not configured',
+      });
+    }
+
+    const netCents = dollarsToCents(dollars);
+    const feeBreakdown = grossUpForAchDeposit(netCents);
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        stripeCustomerId: true,
+      },
+    });
+
+    if (!user?.stripeCustomerId) {
+      return res.status(400).json({
+        ok: false,
+        error: 'No Stripe customer found. Please save a payment method first.',
+      });
+    }
+
+    const achMethod = await prisma.paymentMethod.findFirst({
+      where: {
+        userId,
+        type: 'US_BANK',
+        status: 'ACTIVE',
+        isDefaultCharge: true,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (!achMethod?.stripePaymentMethodId) {
+      return res.status(400).json({
+        ok: false,
+        code: 'NO_SAVED_ACH',
+        error: 'No saved ACH bank account found. Please link a bank account first.',
+      });
+    }
+
+    const wallet = await getWalletOrCreate(userId);
+
+    const pi = await stripe.paymentIntents.create({
+      amount: feeBreakdown.grossCents,
+      currency: 'usd',
+      customer: user.stripeCustomerId,
+      payment_method: achMethod.stripePaymentMethodId,
+      payment_method_types: ['us_bank_account'],
+      confirm: true,
+      metadata: {
+        userId,
+        walletId: wallet.id,
+        purpose: 'wallet_deposit_ach',
+        netCents: String(feeBreakdown.netCents),
+        grossCents: String(feeBreakdown.grossCents),
+        estimatedAchFeeCents: String(feeBreakdown.estimatedAchFeeCents),
+        peerfundFeeCents: String(feeBreakdown.peerfundFeeCents),
+        totalFeeCents: String(feeBreakdown.totalFeeCents),
+      },
+    });
+
+    const updatedWallet = await prisma.$transaction(async (tx) => {
+      const updated = await tx.wallet.update({
+        where: { id: wallet.id },
+        data: {
+          pendingCents: { increment: feeBreakdown.netCents },
+        },
+      });
+
+      await tx.walletLedger.create({
+        data: {
+          walletId: wallet.id,
+          type: 'DEPOSIT',
+          amountCents: feeBreakdown.netCents,
+          direction: 'CREDIT',
+          balanceAfterCents: updated.availableCents,
+          referenceType: 'StripePI',
+          referenceId: null,
+          metadata: {
+            externalId: pi.id,
+            provider: 'stripe',
+            method: 'ach',
+            status: pi.status,
+            pending: true,
+            customerId: user.stripeCustomerId,
+            paymentMethodId: achMethod.stripePaymentMethodId,
+
+            netCents: feeBreakdown.netCents,
+            grossCents: feeBreakdown.grossCents,
+            estimatedAchFeeCents: feeBreakdown.estimatedAchFeeCents,
+            peerfundFeeCents: feeBreakdown.peerfundFeeCents,
+            totalFeeCents: feeBreakdown.totalFeeCents,
+          },
+        },
+      });
+
+      return updated;
+    });
+
+    return res.json({
+      ok: true,
+      status: pi.status,
+      paymentIntentId: pi.id,
+      availableCents: updatedWallet.availableCents,
+      pendingCents: updatedWallet.pendingCents,
+      available: updatedWallet.availableCents / 100,
+      pending: updatedWallet.pendingCents / 100,
+      deposit: {
+        method: 'ach',
+        netCents: feeBreakdown.netCents,
+        grossCents: feeBreakdown.grossCents,
+        estimatedAchFeeCents: feeBreakdown.estimatedAchFeeCents,
+        peerfundFeeCents: feeBreakdown.peerfundFeeCents,
+        totalFeeCents: feeBreakdown.totalFeeCents,
+      },
+    });
+  } catch (err) {
+    console.error('depositFromSavedAch error:', err);
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        err?.raw?.message ||
+        err?.message ||
+        'Failed to start ACH deposit',
     });
   }
 };

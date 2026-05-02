@@ -10,6 +10,7 @@ router.get('/me', authenticateToken, walletController.getMyWallet);
 
 // NEW: deposit using saved funding card
 router.post('/deposit', authenticateToken, walletController.depositFromFundingCard);
+router.post('/deposit-ach', authenticateToken, walletController.depositFromSavedAch);
 
 // 🔹 NEW: withdraw from wallet
 router.post(

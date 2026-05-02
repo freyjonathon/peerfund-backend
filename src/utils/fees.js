@@ -8,6 +8,11 @@ const BANKING_FEE_RATE = 0.05;  // 5%
 const STRIPE_CARD_PERCENT = 0.029; // 2.9%
 const STRIPE_CARD_FIXED_CENTS = 30;
 
+// ACH deposit processing estimate
+const STRIPE_ACH_PERCENT = 0.008; // 0.8%
+const STRIPE_ACH_MAX_FEE_CENTS = 500; // $5 cap
+const PEERFUND_ACH_DEPOSIT_FEE_RATE = 0.01; // 1%, adjust if desired
+
 // Set PeerFund deposit fee here.
 // Use 0 for now if you only want users to cover Stripe fees.
 const PEERFUND_DEPOSIT_FEE_RATE = 0.01; // 1%
@@ -39,6 +44,31 @@ function dollarsToCents(amountDollars) {
 
 function centsToDollars(cents) {
   return Number((Number(cents || 0) / 100).toFixed(2));
+}
+
+function grossUpForAchDeposit(netCents) {
+  const peerfundFeeCents = Math.ceil(netCents * PEERFUND_ACH_DEPOSIT_FEE_RATE);
+
+  // Gross up ACH so Stripe fee is also covered.
+  // Since ACH is capped, calculate uncapped first, then cap.
+  const preliminaryGross = Math.ceil(
+    (netCents + peerfundFeeCents) / (1 - STRIPE_ACH_PERCENT)
+  );
+
+  const estimatedAchFeeCents = Math.min(
+    STRIPE_ACH_MAX_FEE_CENTS,
+    Math.ceil(preliminaryGross * STRIPE_ACH_PERCENT)
+  );
+
+  const grossCents = netCents + peerfundFeeCents + estimatedAchFeeCents;
+
+  return {
+    netCents,
+    grossCents,
+    estimatedAchFeeCents,
+    peerfundFeeCents,
+    totalFeeCents: grossCents - netCents,
+  };
 }
 
 function grossUpForCardDeposit(netCents) {
@@ -77,4 +107,8 @@ module.exports = {
   dollarsToCents,
   centsToDollars,
   grossUpForCardDeposit,
-};
+  STRIPE_ACH_PERCENT,
+  STRIPE_ACH_MAX_FEE_CENTS,
+  PEERFUND_ACH_DEPOSIT_FEE_RATE,
+  grossUpForAchDeposit,
+  };
