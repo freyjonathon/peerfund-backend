@@ -9,6 +9,51 @@ const {
   grossUpForAchDeposit,
 } = require('../utils/fees');
 
+const PLATFORM_USER_ID =
+  process.env.PLATFORM_FEE_USER_ID || '68f523b619356751fcb1ed4b';
+
+async function recordDepositFeeTransactions({
+  tx,
+  userId,
+  peerfundFeeCents = 0,
+  processingFeeCents = 0,
+  method = 'card',
+}) {
+  if (!userId || !PLATFORM_USER_ID) return;
+
+  const rows = [];
+
+  if (peerfundFeeCents > 0) {
+    rows.push({
+      type: 'PLATFORM_FEE',
+      amount: peerfundFeeCents / 100,
+      fromUserId: userId,
+      toUserId: PLATFORM_USER_ID,
+      peerfundFee: peerfundFeeCents / 100,
+      bankingFee: 0,
+      processedAt: new Date(),
+      timestamp: new Date(),
+    });
+  }
+
+  if (processingFeeCents > 0) {
+    rows.push({
+      type: method === 'ach' ? 'ACH_FEE_RECOVERY' : 'STRIPE_FEE_RECOVERY',
+      amount: processingFeeCents / 100,
+      fromUserId: userId,
+      toUserId: PLATFORM_USER_ID,
+      peerfundFee: 0,
+      bankingFee: processingFeeCents / 100,
+      processedAt: new Date(),
+      timestamp: new Date(),
+    });
+  }
+
+  if (rows.length) {
+    await tx.transaction.createMany({ data: rows });
+  }
+}
+
 /**
  * GET /api/wallet/me
  */
@@ -40,10 +85,6 @@ exports.getMyWallet = async (req, res) => {
 
 /**
  * POST /api/wallet/webhook/stripe
- *
- * Finalizes ACH wallet deposits:
- * - payment_intent.succeeded: pendingCents -> availableCents
- * - payment_intent.payment_failed: removes pendingCents
  */
 exports.stripeWebhook = async (req, res) => {
   if (!stripe) return res.status(501).send('Stripe not configured');
@@ -76,7 +117,10 @@ exports.stripeWebhook = async (req, res) => {
     }
 
     const walletId = pi.metadata?.walletId;
+    const userId = pi.metadata?.userId;
     const netCents = Number(pi.metadata?.netCents || 0);
+    const peerfundFeeCents = Number(pi.metadata?.peerfundFeeCents || 0);
+    const processingFeeCents = Number(pi.metadata?.estimatedAchFeeCents || 0);
 
     if (!walletId || !Number.isInteger(netCents) || netCents <= 0) {
       console.warn('Wallet ACH webhook missing walletId/netCents', {
@@ -92,12 +136,13 @@ exports.stripeWebhook = async (req, res) => {
     });
 
     if (!wallet) {
-      console.warn('Wallet not found for ACH webhook', { walletId, paymentIntentId: pi.id });
+      console.warn('Wallet not found for ACH webhook', {
+        walletId,
+        paymentIntentId: pi.id,
+      });
       return res.json({ received: true });
     }
 
-    // Find the original pending ledger row.
-    // Because metadata is Json, safest approach is to pull recent StripePI rows and filter in JS.
     const recentLedgers = await prisma.walletLedger.findMany({
       where: {
         walletId,
@@ -131,7 +176,9 @@ exports.stripeWebhook = async (req, res) => {
           where: { id: walletId },
         });
 
-        if (!currentWallet) throw new Error('Wallet disappeared during ACH settlement');
+        if (!currentWallet) {
+          throw new Error('Wallet disappeared during ACH settlement');
+        }
 
         const pendingDecrement = Math.min(currentWallet.pendingCents, netCents);
         const newAvailable = currentWallet.availableCents + netCents;
@@ -157,6 +204,14 @@ exports.stripeWebhook = async (req, res) => {
             },
           },
         });
+
+        await recordDepositFeeTransactions({
+          tx,
+          userId,
+          peerfundFeeCents,
+          processingFeeCents,
+          method: 'ach',
+        });
       });
 
       console.log('✅ ACH wallet deposit settled', {
@@ -172,7 +227,9 @@ exports.stripeWebhook = async (req, res) => {
           where: { id: walletId },
         });
 
-        if (!currentWallet) throw new Error('Wallet disappeared during ACH failure');
+        if (!currentWallet) {
+          throw new Error('Wallet disappeared during ACH failure');
+        }
 
         const pendingDecrement = Math.min(currentWallet.pendingCents, netCents);
 
@@ -213,23 +270,12 @@ exports.stripeWebhook = async (req, res) => {
   }
 };
 
-/**
- * LEGACY DEV helper – no longer used.
- */
 exports.devConfirmDeposit = async (_req, res) => {
   return res.status(501).json({ error: 'devConfirmDeposit is no longer used' });
 };
 
 /**
  * POST /api/wallet/deposit
- * Body: { amountDollars }
- *
- * Real card deposit flow:
- * - User chooses amount to add to wallet
- * - Backend grosses up charge so user pays Stripe + PeerFund deposit fees
- * - Stripe charges gross amount
- * - Wallet receives net amount only
- * - Fee breakdown is stored in ledger metadata
  */
 exports.depositFromFundingCard = async (req, res) => {
   try {
@@ -276,7 +322,6 @@ exports.depositFromFundingCard = async (req, res) => {
 
     const wallet = await getWalletOrCreate(userId);
 
-    // 1) Charge the saved funding card for gross amount
     const pi = await stripe.paymentIntents.create({
       amount: feeBreakdown.grossCents,
       currency: 'usd',
@@ -288,8 +333,6 @@ exports.depositFromFundingCard = async (req, res) => {
         userId,
         walletId: wallet.id,
         purpose: 'wallet_deposit',
-
-        // Fee details
         netCents: String(feeBreakdown.netCents),
         grossCents: String(feeBreakdown.grossCents),
         estimatedStripeFeeCents: String(feeBreakdown.estimatedStripeFeeCents),
@@ -305,7 +348,6 @@ exports.depositFromFundingCard = async (req, res) => {
       });
     }
 
-    // 2) Credit wallet with NET deposit amount only
     const updatedWallet = await prisma.$transaction(async (tx) => {
       const updated = await tx.wallet.update({
         where: { id: wallet.id },
@@ -326,10 +368,10 @@ exports.depositFromFundingCard = async (req, res) => {
           metadata: {
             externalId: pi.id,
             provider: 'stripe',
+            method: 'card',
             status: pi.status,
             customerId: user.stripeCustomerId,
             paymentMethodId: user.fundingPaymentMethodId,
-
             netCents: feeBreakdown.netCents,
             grossCents: feeBreakdown.grossCents,
             estimatedStripeFeeCents: feeBreakdown.estimatedStripeFeeCents,
@@ -337,6 +379,14 @@ exports.depositFromFundingCard = async (req, res) => {
             totalFeeCents: feeBreakdown.totalFeeCents,
           },
         },
+      });
+
+      await recordDepositFeeTransactions({
+        tx,
+        userId,
+        peerfundFeeCents: feeBreakdown.peerfundFeeCents,
+        processingFeeCents: feeBreakdown.estimatedStripeFeeCents,
+        method: 'card',
       });
 
       return updated;
@@ -360,28 +410,18 @@ exports.depositFromFundingCard = async (req, res) => {
   } catch (err) {
     console.error('depositFromFundingCard error:', err);
 
-    const stripeMsg =
-      err?.raw?.message ||
-      err?.message ||
-      'Failed to deposit from funding card';
-
     return res.status(500).json({
       ok: false,
-      error: stripeMsg,
+      error:
+        err?.raw?.message ||
+        err?.message ||
+        'Failed to deposit from funding card',
     });
   }
 };
 
 /**
  * POST /api/wallet/deposit-ach
- * Body: { amountDollars }
- *
- * ACH deposit flow:
- * - User chooses amount to add to wallet
- * - Backend grosses up charge so user covers ACH + PeerFund fees
- * - Stripe charges gross amount using saved ACH PaymentMethod
- * - Wallet gets NET amount in pendingCents first
- * - Webhook later moves pending -> available after payment_intent.succeeded
  */
 exports.depositFromSavedAch = async (req, res) => {
   try {
@@ -489,7 +529,6 @@ exports.depositFromSavedAch = async (req, res) => {
             pending: true,
             customerId: user.stripeCustomerId,
             paymentMethodId: achMethod.stripePaymentMethodId,
-
             netCents: feeBreakdown.netCents,
             grossCents: feeBreakdown.grossCents,
             estimatedAchFeeCents: feeBreakdown.estimatedAchFeeCents,
@@ -534,13 +573,6 @@ exports.depositFromSavedAch = async (req, res) => {
 
 /**
  * POST /api/wallet/withdraw
- * Body: { amountDollars }
- *
- * Real withdrawal flow:
- * - Requires user's Stripe Connect payout account
- * - Creates Stripe transfer from PeerFund platform to connected account
- * - Debits wallet available balance
- * - Stores Stripe transfer ID in metadata, not referenceId
  */
 exports.withdrawFunds = async (req, res) => {
   try {
@@ -617,7 +649,6 @@ exports.withdrawFunds = async (req, res) => {
       });
     }
 
-    // 1) Send funds from PeerFund platform balance to user's connected account
     const transfer = await stripe.transfers.create({
       amount: amountCents,
       currency: 'usd',
@@ -629,7 +660,6 @@ exports.withdrawFunds = async (req, res) => {
       },
     });
 
-    // 2) Debit wallet after Stripe transfer creation succeeds
     const updatedWallet = await prisma.$transaction(async (tx) => {
       const updated = await tx.wallet.update({
         where: { id: wallet.id },
