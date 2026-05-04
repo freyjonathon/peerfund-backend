@@ -196,23 +196,48 @@ exports.acceptLoanOffer = async (req, res) => {
         .json({ error: 'Offer has invalid amount' });
     }
 
-    // Require borrower to have a saved Wallet funding card for future repayments
-    const borrowerFunding = await prisma.user.findUnique({
-      where: { id: userId },
-      select: {
-        stripeCustomerId: true,
-        fundingPaymentMethodId: true,
-        fundingCardLast4: true,
-        fundingCardBrand: true,
-      },
-    });
+    // Require borrower to have at least one saved Wallet funding method
+// for future repayments: saved card OR saved ACH bank.
+const borrowerFunding = await prisma.user.findUnique({
+  where: { id: userId },
+  select: {
+    stripeCustomerId: true,
+    fundingPaymentMethodId: true,
+    fundingCardLast4: true,
+    fundingCardBrand: true,
+  },
+});
 
-    if (!borrowerFunding?.stripeCustomerId || !borrowerFunding?.fundingPaymentMethodId) {
-      return res.status(400).json({
-        error: 'Please save a funding card in your Wallet before accepting this loan.',
-        code: 'MISSING_WALLET_FUNDING_CARD',
-      });
-    }
+const savedAchFunding = await prisma.paymentMethod.findFirst({
+  where: {
+    userId,
+    type: 'US_BANK',
+    status: 'ACTIVE',
+    isDefaultCharge: true,
+  },
+  select: {
+    id: true,
+    stripePaymentMethodId: true,
+    last4: true,
+    bankName: true,
+    accountType: true,
+  },
+  orderBy: { createdAt: 'desc' },
+});
+
+const hasSavedCard =
+  !!borrowerFunding?.stripeCustomerId && !!borrowerFunding?.fundingPaymentMethodId;
+
+const hasSavedAch =
+  !!borrowerFunding?.stripeCustomerId && !!savedAchFunding?.stripePaymentMethodId;
+
+if (!hasSavedCard && !hasSavedAch) {
+  return res.status(400).json({
+    error:
+      'Please save a funding method in your Wallet before accepting this loan. You can use a debit/card or ACH bank account.',
+    code: 'MISSING_WALLET_FUNDING_METHOD',
+  });
+}
 
     // Make sure we don't already have a loan for this request
     const existingLoan = await prisma.loan.findFirst({
