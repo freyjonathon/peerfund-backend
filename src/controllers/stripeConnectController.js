@@ -408,3 +408,42 @@ exports.saveLoanPaymentMethod = async (req, res) => {
     return res.status(500).json({ error: 'Failed to save payment method for loans' });
   }
 };
+
+exports.getAchPaymentMethod = async (req, res) => {
+  try {
+    const me = await getMe(req);
+    if (!me) return res.status(401).json({ error: 'Unauthorized' });
+
+    const pm = await prisma.paymentMethod.findFirst({
+      where: {
+        userId: me.id,
+        type: 'US_BANK',
+        status: 'ACTIVE',
+        isDefaultCharge: true,
+      },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        stripePaymentMethodId: true,
+        last4: true,
+        bankName: true,
+        accountType: true,
+      },
+    });
+
+    return res.json({
+      hasAch: !!pm,
+      paymentMethod: pm
+        ? {
+            id: pm.id,
+            last4: pm.last4,
+            bankName: pm.bankName,
+            accountType: pm.accountType,
+          }
+        : null,
+    });
+  } catch (err) {
+    console.error('getAchPaymentMethod error:', err);
+    return res.status(500).json({ error: 'Failed to fetch ACH payment method' });
+  }
+};
