@@ -5,16 +5,13 @@ const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 
 const {
-  stripe,                         // Stripe SDK (from your lib)
-  ensureStripeCustomerFor,        // (prisma, user) -> customerId
-  ensureConnectAccountFor,        // (prisma, user) -> accountId
-  createConnectOnboardingLink,    // (accountId, refreshUrl?, returnUrl?) -> accountLinks.create(...)
-  getConnectAccount,              // (accountId) -> stripe.accounts.retrieve(...)
+  stripe,
+  ensureStripeCustomerFor,
+  ensureConnectAccountFor,
+  createConnectOnboardingLink,
+  getConnectAccount,
 } = require('../lib/stripeIdentities');
 
-/* ------------------------------------------------------------------ */
-/* Utility: get authenticated user + id                               */
-/* ------------------------------------------------------------------ */
 async function getMe(req) {
   const userId = req.user?.id || req.user?.userId;
   if (!userId) return null;
@@ -26,16 +23,8 @@ function firstOrigin(envVal, fallback) {
 }
 
 const FRONTEND_ORIGIN = firstOrigin(process.env.FRONTEND_ORIGIN, 'http://localhost:3000');
-const API_ORIGIN      = firstOrigin(process.env.API_ORIGIN,      'http://localhost:5050');
+const API_ORIGIN = firstOrigin(process.env.API_ORIGIN, 'http://localhost:5050');
 
-/* ================================================================== */
-/*  Customers (borrower ACH debits; wallet deposits)                   */
-/* ================================================================== */
-
-/**
- * POST /api/stripe/ensure-customer
- * Ensures the authenticated user has a Stripe Customer (for ACH debits etc).
- */
 exports.ensureCustomer = async (req, res) => {
   try {
     const me = await getMe(req);
@@ -49,14 +38,6 @@ exports.ensureCustomer = async (req, res) => {
   }
 };
 
-/* ================================================================== */
-/*  Connect (payouts)                                                  */
-/* ================================================================== */
-
-/**
- * POST /api/stripe/ensure-connect-account
- * Ensures the authenticated user has a Connect Express account.
- */
 exports.ensureConnectAccount = async (req, res) => {
   try {
     const me = await getMe(req);
@@ -65,9 +46,9 @@ exports.ensureConnectAccount = async (req, res) => {
     const accountId = await ensureConnectAccountFor(prisma, me);
     return res.json({ accountId });
   } catch (err) {
-    const stripeMsg  = err?.raw?.message || err?.message || 'Failed to ensure connect account';
+    const stripeMsg = err?.raw?.message || err?.message || 'Failed to ensure connect account';
     const stripeCode = err?.raw?.code || err?.code || null;
-    const requestId  = err?.raw?.requestId || err?.requestId || null;
+    const requestId = err?.raw?.requestId || err?.requestId || null;
 
     console.error('ensureConnectAccount error', {
       message: stripeMsg,
@@ -85,10 +66,6 @@ exports.ensureConnectAccount = async (req, res) => {
   }
 };
 
-/**
- * POST /api/stripe/create-connect-account
- * Alias to ensure a Connect account exists; returns the accountId.
- */
 exports.createConnectAccount = async (req, res) => {
   try {
     const me = await getMe(req);
@@ -102,13 +79,6 @@ exports.createConnectAccount = async (req, res) => {
   }
 };
 
-/**
- * POST /api/stripe/connect-onboarding-link
- * Body: { refreshUrl?, returnUrl? }
- * Creates an onboarding link for the user's Connect account and returns a redirect URL.
- *
- * 🔁 Option B: Stripe returns to the API route; API then redirects to frontend.
- */
 exports.createOnboardingLink = async (req, res) => {
   try {
     const me = await getMe(req);
@@ -116,9 +86,8 @@ exports.createOnboardingLink = async (req, res) => {
 
     const accountId = await ensureConnectAccountFor(prisma, me);
 
-    // Default: use API callback so backend can mark completion and redirect to UI
     const refreshUrl = req.body?.refreshUrl || `${API_ORIGIN}/api/stripe/onboarding/return`;
-    const returnUrl  = req.body?.returnUrl  || `${API_ORIGIN}/api/stripe/onboarding/return`;
+    const returnUrl = req.body?.returnUrl || `${API_ORIGIN}/api/stripe/onboarding/return`;
 
     const link = await createConnectOnboardingLink(accountId, refreshUrl, returnUrl);
     return res.json({ url: link.url, accountId });
@@ -128,10 +97,6 @@ exports.createOnboardingLink = async (req, res) => {
   }
 };
 
-/**
- * GET /api/stripe/connect-account
- * Returns summarized status for the user's Connect account (payouts, details_submitted).
- */
 exports.getConnectAccountStatus = async (req, res) => {
   try {
     const me = await getMe(req);
@@ -140,7 +105,6 @@ exports.getConnectAccountStatus = async (req, res) => {
 
     const acct = await getConnectAccount(me.stripeAccountId);
 
-    // update convenience flag in DB
     const completed = !!acct?.details_submitted;
     if (me.connectOnboardingCompleted !== completed) {
       await prisma.user.update({
@@ -162,11 +126,6 @@ exports.getConnectAccountStatus = async (req, res) => {
   }
 };
 
-/**
- * GET /api/stripe/onboarding/return
- * Stripe redirects here after onboarding. We check status and
- * immediately redirect to the frontend Payment Method page.
- */
 exports.handleOnboardingReturn = async (req, res) => {
   try {
     const me = await getMe(req);
@@ -175,7 +134,7 @@ exports.handleOnboardingReturn = async (req, res) => {
     }
 
     if (!me.stripeAccountId) {
-      return res.redirect(`${FRONTEND_ORIGIN}/payment-method?onboarding=missing`);
+      return res.redirect(`${FRONTEND_ORIGIN}/wallet?onboarding=missing`);
     }
 
     const acct = await getConnectAccount(me.stripeAccountId);
@@ -188,22 +147,13 @@ exports.handleOnboardingReturn = async (req, res) => {
       });
     }
 
-    // Send them back to Payment Method with a status flag
-    return res.redirect(`${FRONTEND_ORIGIN}/payment-method?onboarding=${done ? 'ok' : 'pending'}`);
+    return res.redirect(`${FRONTEND_ORIGIN}/wallet?onboarding=${done ? 'ok' : 'pending'}`);
   } catch (err) {
     console.error('handleOnboardingReturn error', err);
-    return res.redirect(`${FRONTEND_ORIGIN}/payment-method?onboarding=error`);
+    return res.redirect(`${FRONTEND_ORIGIN}/wallet?onboarding=error`);
   }
 };
 
-/* ================================================================== */
-/*  Bank linking (Customer, for ACH debits / wallet deposits)          */
-/* ================================================================== */
-
-/**
- * POST /api/stripe/create-bank-setup-intent
- * Creates a SetupIntent for collecting a US bank account via Financial Connections.
- */
 exports.createBankSetupIntent = async (req, res) => {
   try {
     const me = await getMe(req);
@@ -231,13 +181,6 @@ exports.createBankSetupIntent = async (req, res) => {
   }
 };
 
-/**
- * POST /api/stripe/save-ach-payment-method
- * Body: { paymentMethodId }
- *
- * Saves a us_bank_account PaymentMethod as the user's default ACH charge method
- * for wallet ACH deposits.
- */
 exports.saveAchPaymentMethod = async (req, res) => {
   try {
     const me = await getMe(req);
@@ -289,6 +232,7 @@ exports.saveAchPaymentMethod = async (req, res) => {
     const saved = await prisma.paymentMethod.upsert({
       where: { stripePaymentMethodId: paymentMethodId },
       update: {
+        userId: me.id,
         stripeCustomerId: customerId,
         type: 'US_BANK',
         brand: bankName || 'us_bank_account',
@@ -321,9 +265,9 @@ exports.saveAchPaymentMethod = async (req, res) => {
     return res.json({
       ok: true,
       paymentMethodId: saved.stripePaymentMethodId,
-      last4,
-      bankName,
-      accountType,
+      last4: saved.last4,
+      bankName: saved.bankName,
+      accountType: saved.accountType,
     });
   } catch (err) {
     console.error('saveAchPaymentMethod error', err);
@@ -333,14 +277,6 @@ exports.saveAchPaymentMethod = async (req, res) => {
   }
 };
 
-/* ================================================================== */
-/*  Loan funding: store borrower’s receiving bank (PaymentMethod)      */
-/* ================================================================== */
-
-/**
- * GET /api/stripe/has-loan-payment-method
- * Returns { hasLoanPaymentMethod: boolean }
- */
 exports.hasLoanPaymentMethod = async (req, res) => {
   try {
     const me = await getMe(req);
@@ -357,11 +293,6 @@ exports.hasLoanPaymentMethod = async (req, res) => {
   }
 };
 
-/**
- * POST /api/stripe/save-loan-payment-method
- * Body: { paymentMethodId }
- * Saves a us_bank_account PaymentMethod as the borrower’s receiving bank for loans.
- */
 exports.saveLoanPaymentMethod = async (req, res) => {
   try {
     const me = await getMe(req);
@@ -372,37 +303,58 @@ exports.saveLoanPaymentMethod = async (req, res) => {
       return res.status(400).json({ error: 'Missing paymentMethodId' });
     }
 
-    // Retrieve PM from Stripe to extract brand + last4
     const pm = await stripe.paymentMethods.retrieve(paymentMethodId);
 
     if (!pm || pm.type !== 'us_bank_account') {
       return res.status(400).json({ error: 'Invalid payment method type' });
     }
 
-    const last4 = pm.us_bank_account?.last4 || null;
-    const brand = pm.us_bank_account?.bank_name || 'us_bank_account';
+    const bank = pm.us_bank_account || {};
+    const last4 = bank.last4 || null;
+    const bankName = bank.bank_name || null;
+    const accountType = bank.account_type || null;
+    const fingerprint = bank.fingerprint || null;
 
-    // (Optional) clear previous “loan” PMs so only one is active
     await prisma.paymentMethod.updateMany({
       where: { userId: me.id, isForLoans: true },
       data: { isForLoans: false },
     });
 
-    // Upsert this one
     const saved = await prisma.paymentMethod.upsert({
       where: { stripePaymentMethodId: paymentMethodId },
-      update: { isForLoans: true, last4, brand },
+      update: {
+        type: 'US_BANK',
+        brand: bankName || 'us_bank_account',
+        last4,
+        bankName,
+        accountType,
+        bankFingerprint: fingerprint,
+        status: 'ACTIVE',
+        isForLoans: true,
+      },
       create: {
         userId: me.id,
         stripePaymentMethodId: paymentMethodId,
-        brand,
+        type: 'US_BANK',
+        brand: bankName || 'us_bank_account',
         last4,
+        bankName,
+        accountType,
+        bankFingerprint: fingerprint,
+        status: 'ACTIVE',
         isForLoans: true,
-        isDefault: false, // don’t affect wallet deposits default
+        isDefault: false,
+        isDefaultCharge: false,
       },
     });
 
-    return res.json({ ok: true, paymentMethodId: saved.stripePaymentMethodId, last4, brand });
+    return res.json({
+      ok: true,
+      paymentMethodId: saved.stripePaymentMethodId,
+      last4: saved.last4,
+      bankName: saved.bankName,
+      accountType: saved.accountType,
+    });
   } catch (err) {
     console.error('saveLoanPaymentMethod error', err);
     return res.status(500).json({ error: 'Failed to save payment method for loans' });
@@ -414,11 +366,11 @@ exports.getAchPaymentMethod = async (req, res) => {
     const me = await getMe(req);
     if (!me) return res.status(401).json({ error: 'Unauthorized' });
 
-    const pm = await prisma.paymentMethod.findFirst({
+    let pm = await prisma.paymentMethod.findFirst({
       where: {
         userId: me.id,
-        type: 'US_BANK',
         status: 'ACTIVE',
+        type: 'US_BANK',
         isDefaultCharge: true,
       },
       orderBy: { createdAt: 'desc' },
@@ -428,19 +380,70 @@ exports.getAchPaymentMethod = async (req, res) => {
         last4: true,
         bankName: true,
         accountType: true,
+        brand: true,
+        isDefaultCharge: true,
+        isDefault: true,
+        isForLoans: true,
       },
     });
 
+    if (!pm) {
+      pm = await prisma.paymentMethod.findFirst({
+        where: {
+          userId: me.id,
+          AND: [
+            {
+              OR: [
+                { type: 'US_BANK' },
+                { brand: 'us_bank_account' },
+                { brand: { contains: 'bank', mode: 'insensitive' } },
+              ],
+            },
+            {
+              OR: [
+                { status: 'ACTIVE' },
+                { status: undefined },
+              ],
+            },
+            {
+              OR: [
+                { isDefaultCharge: true },
+                { isDefault: true },
+                { isForLoans: true },
+              ],
+            },
+          ],
+        },
+        orderBy: { createdAt: 'desc' },
+        select: {
+          id: true,
+          stripePaymentMethodId: true,
+          last4: true,
+          bankName: true,
+          accountType: true,
+          brand: true,
+          isDefaultCharge: true,
+          isDefault: true,
+          isForLoans: true,
+        },
+      });
+    }
+
+    if (!pm) {
+      return res.json({
+        hasAch: false,
+        paymentMethod: null,
+      });
+    }
+
     return res.json({
-      hasAch: !!pm,
-      paymentMethod: pm
-        ? {
-            id: pm.id,
-            last4: pm.last4,
-            bankName: pm.bankName,
-            accountType: pm.accountType,
-          }
-        : null,
+      hasAch: true,
+      paymentMethod: {
+        id: pm.id,
+        last4: pm.last4,
+        bankName: pm.bankName || pm.brand || 'Bank account',
+        accountType: pm.accountType,
+      },
     });
   } catch (err) {
     console.error('getAchPaymentMethod error:', err);
