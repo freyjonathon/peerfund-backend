@@ -21,6 +21,7 @@ router.post('/save-loan-payment-method', authenticateToken, connectCtl.saveLoanP
 
 
 router.get('/ach-payment-method', authenticateToken, connectCtl.getAchPaymentMethod);
+router.get('/achPaymentMethod', authenticateToken, connectCtl.getAchPaymentMethod);
 
 // ✅ Stripe redirects back to FRONTEND (not API) so this route is optional.
 // If you keep it, it should NOT expect auth.
