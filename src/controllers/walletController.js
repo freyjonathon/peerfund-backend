@@ -83,6 +83,7 @@ exports.getMyWallet = async (req, res) => {
   }
 };
 
+
 /**
  * POST /api/wallet/webhook/stripe
  */
@@ -95,7 +96,12 @@ exports.stripeWebhook = async (req, res) => {
   let event;
 
   try {
-    event = stripe.webhooks.constructEvent(req.rawBody || req.body, sig, secret);
+    event = stripe.webhooks.constructEvent(
+      req.rawBody || req.body,
+      sig,
+      secret
+    );
+
     console.log('✅ Wallet Stripe webhook:', event.type);
   } catch (err) {
     console.error('❌ Wallet webhook signature failed:', err.message);
@@ -105,29 +111,32 @@ exports.stripeWebhook = async (req, res) => {
   try {
     const pi = event.data.object;
 
+    // Only care about ACH wallet deposits
     if (
-      event.type !== 'payment_intent.succeeded' &&
-      event.type !== 'payment_intent.payment_failed'
+      pi?.metadata?.purpose !== 'wallet_deposit_ach'
     ) {
-      return res.json({ received: true });
-    }
-
-    if (pi.metadata?.purpose !== 'wallet_deposit_ach') {
       return res.json({ received: true });
     }
 
     const walletId = pi.metadata?.walletId;
     const userId = pi.metadata?.userId;
-    const netCents = Number(pi.metadata?.netCents || 0);
-    const peerfundFeeCents = Number(pi.metadata?.peerfundFeeCents || 0);
-    const processingFeeCents = Number(pi.metadata?.estimatedAchFeeCents || 0);
 
-    if (!walletId || !Number.isInteger(netCents) || netCents <= 0) {
-      console.warn('Wallet ACH webhook missing walletId/netCents', {
+    const netCents = Number(pi.metadata?.netCents || 0);
+    const peerfundFeeCents = Number(
+      pi.metadata?.peerfundFeeCents || 0
+    );
+
+    const processingFeeCents = Number(
+      pi.metadata?.estimatedAchFeeCents || 0
+    );
+
+    if (!walletId || !netCents) {
+      console.warn('Missing wallet metadata on ACH webhook', {
+        paymentIntentId: pi.id,
         walletId,
         netCents,
-        paymentIntentId: pi.id,
       });
+
       return res.json({ received: true });
     }
 
@@ -140,21 +149,34 @@ exports.stripeWebhook = async (req, res) => {
         walletId,
         paymentIntentId: pi.id,
       });
+
       return res.json({ received: true });
     }
 
-    const recentLedgers = await prisma.walletLedger.findMany({
+    // Find pending ACH ledger row
+    let pendingLedger = await prisma.walletLedger.findFirst({
       where: {
         walletId,
         type: 'DEPOSIT',
         referenceType: 'StripePI',
       },
       orderBy: { createdAt: 'desc' },
-      take: 50,
     });
 
-    const pendingLedger = recentLedgers.find((row) => {
+    // More precise match if metadata exists
+    const ledgers = await prisma.walletLedger.findMany({
+      where: {
+        walletId,
+        type: 'DEPOSIT',
+        referenceType: 'StripePI',
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
+
+    const matchedLedger = ledgers.find((row) => {
       const meta = row.metadata || {};
+
       return (
         meta.externalId === pi.id &&
         meta.method === 'ach' &&
@@ -162,32 +184,74 @@ exports.stripeWebhook = async (req, res) => {
       );
     });
 
+    if (matchedLedger) {
+      pendingLedger = matchedLedger;
+    }
+
+    // Fallback for old deposits missing metadata
     if (!pendingLedger) {
-      console.log('ACH deposit already finalized or pending ledger not found', {
+      pendingLedger = ledgers.find((row) => {
+        const meta = row.metadata || {};
+
+        return (
+          meta.method === 'ach' &&
+          meta.pending === true &&
+          row.amountCents === netCents
+        );
+      });
+    }
+
+    if (!pendingLedger) {
+      console.warn('No matching ACH pending ledger found', {
         paymentIntentId: pi.id,
         walletId,
       });
+
       return res.json({ received: true });
     }
 
+    /**
+     * =========================================
+     * ACH SUCCEEDED
+     * =========================================
+     */
     if (event.type === 'payment_intent.succeeded') {
+      const alreadySettled =
+        pendingLedger.metadata?.status === 'ACH_SETTLED';
+
+      if (alreadySettled) {
+        console.log('ACH already settled:', pi.id);
+
+        return res.json({ received: true });
+      }
+
       await prisma.$transaction(async (tx) => {
         const currentWallet = await tx.wallet.findUnique({
           where: { id: walletId },
         });
 
         if (!currentWallet) {
-          throw new Error('Wallet disappeared during ACH settlement');
+          throw new Error('Wallet disappeared during settlement');
         }
 
-        const pendingDecrement = Math.min(currentWallet.pendingCents, netCents);
-        const newAvailable = currentWallet.availableCents + netCents;
+        const pendingDecrement = Math.min(
+          currentWallet.pendingCents,
+          netCents
+        );
+
+        const newAvailable =
+          currentWallet.availableCents + netCents;
 
         await tx.wallet.update({
           where: { id: walletId },
           data: {
-            pendingCents: { decrement: pendingDecrement },
-            availableCents: { increment: netCents },
+            pendingCents: {
+              decrement: pendingDecrement,
+            },
+
+            availableCents: {
+              increment: netCents,
+            },
           },
         });
 
@@ -195,12 +259,17 @@ exports.stripeWebhook = async (req, res) => {
           where: { id: pendingLedger.id },
           data: {
             balanceAfterCents: newAvailable,
+
             metadata: {
               ...(pendingLedger.metadata || {}),
+
               pending: false,
               status: 'ACH_SETTLED',
+
               settledAt: new Date().toISOString(),
+
               stripeStatus: pi.status,
+              paymentIntentId: pi.id,
             },
           },
         });
@@ -221,6 +290,11 @@ exports.stripeWebhook = async (req, res) => {
       });
     }
 
+    /**
+     * =========================================
+     * ACH FAILED
+     * =========================================
+     */
     if (event.type === 'payment_intent.payment_failed') {
       await prisma.$transaction(async (tx) => {
         const currentWallet = await tx.wallet.findUnique({
@@ -231,12 +305,17 @@ exports.stripeWebhook = async (req, res) => {
           throw new Error('Wallet disappeared during ACH failure');
         }
 
-        const pendingDecrement = Math.min(currentWallet.pendingCents, netCents);
+        const pendingDecrement = Math.min(
+          currentWallet.pendingCents,
+          netCents
+        );
 
         await tx.wallet.update({
           where: { id: walletId },
           data: {
-            pendingCents: { decrement: pendingDecrement },
+            pendingCents: {
+              decrement: pendingDecrement,
+            },
           },
         });
 
@@ -245,12 +324,17 @@ exports.stripeWebhook = async (req, res) => {
           data: {
             metadata: {
               ...(pendingLedger.metadata || {}),
+
               pending: false,
               status: 'ACH_FAILED',
+
               failedAt: new Date().toISOString(),
+
               stripeStatus: pi.status,
+
               failureMessage:
-                pi.last_payment_error?.message || 'ACH payment failed',
+                pi.last_payment_error?.message ||
+                'ACH payment failed',
             },
           },
         });
@@ -266,7 +350,10 @@ exports.stripeWebhook = async (req, res) => {
     return res.json({ received: true });
   } catch (err) {
     console.error('❌ Wallet webhook handler error:', err);
-    return res.status(500).send('Wallet webhook handler error');
+
+    return res.status(500).send(
+      'Wallet webhook handler error'
+    );
   }
 };
 
