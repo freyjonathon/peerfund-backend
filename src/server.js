@@ -190,6 +190,20 @@ app.use('/api/billing', billingRoutes);
 // Admin transactions endpoint
 app.use('/api', adminTransactionRoutes);
 
+app.get('/api/debug/stripe-routes', (_req, res) => {
+  res.json(
+    stripeRoutes.stack
+      .map((x) => {
+        if (!x.route) return null;
+        return {
+          path: x.route.path,
+          methods: Object.keys(x.route.methods),
+        };
+      })
+      .filter(Boolean)
+  );
+});
+
 // Stripe JSON routes
 app.use('/api/stripe', stripeRoutes);
 
