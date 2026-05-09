@@ -182,14 +182,6 @@ app.use('/api/posts', postRoutes);
 app.use('/api/leaderboard', statsRoutes);
 app.use('/api/loanMessages', loanMessageRoutes);
 
-app.use('/api', inlineDiscussionRoutes);
-app.use('/api', verificationRoutes);
-app.use('/api/direct-requests', directRequestRoutes);
-app.use('/api/billing', billingRoutes);
-
-// Admin transactions endpoint
-app.use('/api', adminTransactionRoutes);
-
 app.get('/api/debug/stripe-routes', (_req, res) => {
   res.json(
     stripeRoutes.stack
@@ -206,6 +198,14 @@ app.get('/api/debug/stripe-routes', (_req, res) => {
 
 // Stripe JSON routes
 app.use('/api/stripe', stripeRoutes);
+
+app.use('/api', inlineDiscussionRoutes);
+app.use('/api', verificationRoutes);
+app.use('/api/direct-requests', directRequestRoutes);
+app.use('/api/billing', billingRoutes);
+
+// Admin transactions endpoint
+app.use('/api', adminTransactionRoutes);
 
 // Wallet protected routes
 app.use('/api/wallet', authenticateToken, walletRoutes);
