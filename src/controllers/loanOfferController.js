@@ -135,8 +135,6 @@ exports.getMyOfferRequests = async (req, res) => {
   }
 };
 
-// src/controllers/loanOfferController.js
-
 /** POST /api/loans/offers/:offerId/accept  (BORROWER action)
  *  Creates the Loan and marks it ACCEPTED.
  *  Lender can later fund via POST /api/loans/:loanId/fund.
@@ -230,14 +228,6 @@ const hasSavedCard =
 
 const hasSavedAch =
   !!borrowerFunding?.stripeCustomerId && !!savedAchFunding?.stripePaymentMethodId;
-
-if (!hasSavedCard && !hasSavedAch) {
-  return res.status(400).json({
-    error:
-      'Please save a funding method in your Wallet before accepting this loan. You can use a debit/card or ACH bank account.',
-    code: 'MISSING_WALLET_FUNDING_METHOD',
-  });
-}
 
     // Make sure we don't already have a loan for this request
     const existingLoan = await prisma.loan.findFirst({
@@ -465,7 +455,9 @@ exports.fundLoanByLender = async (req, res) => {
     // Dollars version (for Transaction + disbursedAmount)
     const principalDollars = principalCents / 100;
 
-    // Quick pre-check: lender wallet exists & has balance
+    // Borrower does NOT need a funding card/ACH to accept.
+    // Accepting means they are receiving loan proceeds into their PeerFund wallet.
+    // Saved ACH should only be required later for repayment or withdrawal.
     const lenderWallet = await getWalletOrCreate(lenderId);
     if (!lenderWallet) {
       return res
@@ -474,6 +466,7 @@ exports.fundLoanByLender = async (req, res) => {
     }
     if (lenderWallet.availableCents < principalCents) {
       return res.status(400).json({
+        code: 'INSUFFICIENT_WALLET_BALANCE',
         error: 'Insufficient wallet balance to fund this loan',
         availableCents: lenderWallet.availableCents,
         requiredCents: principalCents,
