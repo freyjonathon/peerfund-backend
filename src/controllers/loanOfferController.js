@@ -194,124 +194,94 @@ exports.acceptLoanOffer = async (req, res) => {
         .json({ error: 'Offer has invalid amount' });
     }
 
-    // Require borrower to have at least one saved Wallet funding method
-// for future repayments: saved card OR saved ACH bank.
-const borrowerFunding = await prisma.user.findUnique({
-  where: { id: userId },
-  select: {
-    stripeCustomerId: true,
-    fundingPaymentMethodId: true,
-    fundingCardLast4: true,
-    fundingCardBrand: true,
-  },
-});
+          // Borrower receives loan proceeds into their PeerFund wallet.
+      // No saved funding method is required at acceptance.
+      // Saved ACH is only needed later for repayment or withdrawal.
+      await getWalletOrCreate(userId);
 
-const savedAchFunding = await prisma.paymentMethod.findFirst({
-  where: {
-    userId,
-    type: 'US_BANK',
-    status: 'ACTIVE',
-    isDefaultCharge: true,
-  },
-  select: {
-    id: true,
-    stripePaymentMethodId: true,
-    last4: true,
-    bankName: true,
-    accountType: true,
-  },
-  orderBy: { createdAt: 'desc' },
-});
+      // Make sure we don't already have a loan for this request
+      const existingLoan = await prisma.loan.findFirst({
+        where: { loanRequestId: offer.loanRequestId },
+      });
+      if (existingLoan) {
+        return res
+          .status(400)
+          .json({ error: 'Loan already accepted for this request' });
+      }
 
-const hasSavedCard =
-  !!borrowerFunding?.stripeCustomerId && !!borrowerFunding?.fundingPaymentMethodId;
+      const acceptanceTimestamp = new Date();
 
-const hasSavedAch =
-  !!borrowerFunding?.stripeCustomerId && !!savedAchFunding?.stripePaymentMethodId;
-
-    // Make sure we don't already have a loan for this request
-    const existingLoan = await prisma.loan.findFirst({
-      where: { loanRequestId: offer.loanRequestId },
-    });
-    if (existingLoan) {
-      return res
-        .status(400)
-        .json({ error: 'Loan already accepted for this request' });
-    }
-
-    const acceptanceTimestamp = new Date();
-
-    // Interest / schedule math
-    const termRatePct = (Number(offer.interestRate) || 0) + 2;
-    const termRate = termRatePct / 100;
-    const totalBaseRepayment = r2(amount * (1 + termRate));
-    const baseMonthlyPayment = r2(
-      totalBaseRepayment / Number(offer.duration)
-    );
-
-    const repaymentPeerfundEach = offer.lender.isSuperUser
-      ? 0
-      : r2(baseMonthlyPayment * PEERFUND_FEE_RATE);
-
-    const repaymentBankingEach = r2(
-      baseMonthlyPayment * BANKING_FEE_RATE
-    );
-
-    const scheduleRows = [];
-    let due = new Date();
-
-    for (let i = 0; i < Number(offer.duration); i++) {
-      due.setMonth(due.getMonth() + 1);
-
-      const totalCharged = r2(
-        baseMonthlyPayment + repaymentBankingEach + repaymentPeerfundEach
+      // Interest / schedule math
+      const termRatePct = (Number(offer.interestRate) || 0) + 2;
+      const termRate = termRatePct / 100;
+      const totalBaseRepayment = r2(amount * (1 + termRate));
+      const baseMonthlyPayment = r2(
+        totalBaseRepayment / Number(offer.duration)
       );
 
-      scheduleRows.push({
-        loanId: '', // will be filled in after create
-        dueDate: new Date(due),
-        basePayment: baseMonthlyPayment,
-        bankingFee: repaymentBankingEach,
-        peerfundFee: repaymentPeerfundEach,
-        totalCharged,
-        amountDue: totalCharged,
-        amountPaid: 0,
-        status: 'PENDING',
-      });
-    }
+      const repaymentPeerfundEach = offer.lender.isSuperUser
+        ? 0
+        : r2(baseMonthlyPayment * PEERFUND_FEE_RATE);
 
-    const principalCents = Math.round(amount * 100);
-    const termMonths = Number(offer.duration);
-    const interestRateBps = Math.round(
-      Number(offer.interestRate) * 100
-    );
+      const repaymentBankingEach = r2(
+        baseMonthlyPayment * BANKING_FEE_RATE
+      );
 
-    const loan = await prisma.$transaction(async (tx) => {
-      // Create the loan
-      const created = await tx.loan.create({
-        data: {
-          // canonical
-          principalCents,
-          interestRateBps,
-          termMonths,
+      const scheduleRows = [];
+      let due = new Date();
 
-          // legacy mirrors
-          amount,
-          duration: termMonths,
-          interestRate: Number(offer.interestRate),
+      for (let i = 0; i < Number(offer.duration); i++) {
+        due.setMonth(due.getMonth() + 1);
 
-          borrowerId: lr.borrowerId,
-          lenderId: offer.lenderId,
-          loanRequestId: lr.id,
+        const totalCharged = r2(
+          baseMonthlyPayment + repaymentBankingEach + repaymentPeerfundEach
+        );
 
-          status: 'ACCEPTED',
-          createdAt: new Date(),
-          updatedAt: new Date(),
+        scheduleRows.push({
+          loanId: '', // will be filled in after create
+          dueDate: new Date(due),
+          basePayment: baseMonthlyPayment,
+          bankingFee: repaymentBankingEach,
+          peerfundFee: repaymentPeerfundEach,
+          totalCharged,
+          amountDue: totalCharged,
+          amountPaid: 0,
+          status: 'PENDING',
+        });
+      }
 
-          disbursedAmount: 0,
-        },
-        include: { lender: true },
-      });
+      const principalCents = Math.round(amount * 100);
+      const termMonths = Number(offer.duration);
+      const interestRateBps = Math.round(
+        Number(offer.interestRate) * 100
+      );
+
+      const loan = await prisma.$transaction(async (tx) => {
+        // Create the loan
+        const created = await tx.loan.create({
+          data: {
+            // canonical
+            principalCents,
+            interestRateBps,
+            termMonths,
+
+            // legacy mirrors
+            amount,
+            duration: termMonths,
+            interestRate: Number(offer.interestRate),
+
+            borrowerId: lr.borrowerId,
+            lenderId: offer.lenderId,
+            loanRequestId: lr.id,
+
+            status: 'ACCEPTED',
+            createdAt: new Date(),
+            updatedAt: new Date(),
+
+            disbursedAmount: 0,
+          },
+          include: { lender: true },
+        });
 
       // Mark offer + request
       await tx.loanOffer.update({
