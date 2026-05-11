@@ -5,26 +5,37 @@ const { getUserId } = require('../middleware/authMiddleware');
 exports.getMyTransactions = async (req, res) => {
   try {
     const userId = getUserId(req);
+
     if (!userId) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    const currentUser = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, role: true },
+    });
+
+    if (!currentUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const isAdmin = currentUser.role === 'ADMIN';
+
     const transactions = await prisma.transaction.findMany({
-      where: {
-        OR: [
-          { fromUserId: userId },
-          { toUserId: userId },
-        ],
-      },
+      where: isAdmin
+        ? {}
+        : {
+            OR: [{ fromUserId: userId }, { toUserId: userId }],
+          },
       include: {
-        fromUser: { select: { id: true, name: true } },
-        toUser:   { select: { id: true, name: true } },
+        fromUser: { select: { id: true, name: true, email: true } },
+        toUser: { select: { id: true, name: true, email: true } },
       },
-      orderBy: { timestamp: 'desc' }, // or createdAt if that’s your field
+      orderBy: { timestamp: 'desc' },
     });
 
     console.log(
-      `🔎 getMyTransactions: user=${userId} -> ${transactions.length} rows`
+      `🔎 getMyTransactions: user=${userId} admin=${isAdmin} -> ${transactions.length} rows`
     );
 
     return res.json(transactions);
