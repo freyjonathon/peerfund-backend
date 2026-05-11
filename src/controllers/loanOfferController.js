@@ -3,50 +3,31 @@ const prisma = require('../utils/prisma');
 const { PEERFUND_FEE_RATE, BANKING_FEE_RATE } = require('../utils/fees');
 const { ALLOWED_AMOUNTS, isAllowedAmount } = require('../utils/loanTiers');
 const { getUserId } = require('../middleware/authMiddleware');
-const { disburseLoanNow } = require('../services/disbursementService');
 const { WalletEntryType } = require('@prisma/client');
 const { getWalletOrCreate } = require('../utils/wallet');
 
-/**
- * POST /api/loans/:loanId/offers
- * Create an offer for a given loan request.
- * Server pulls canonical amount/duration from the request and enforces tiers.
- */
 exports.submitLoanOffer = async (req, res) => {
   const { loanId } = req.params;
   const userId = req.user.userId;
-  const { interestRate, message } = req.body; // ignore client amount/duration
+  const { interestRate, message } = req.body;
 
   try {
     const loanReq = await prisma.loanRequest.findUnique({
       where: { id: loanId },
-      select: {
-        id: true,
-        borrowerId: true,
-        status: true,
-        amount: true,
-        duration: true,
-      },
+      select: { id: true, borrowerId: true, status: true, amount: true, duration: true },
     });
 
     if (!loanReq) return res.status(404).json({ error: 'Loan request not found' });
-    if (loanReq.status !== 'OPEN') {
-      return res.status(400).json({ error: 'Loan request is not open for offers' });
-    }
-    if (loanReq.borrowerId === userId) {
-      return res.status(403).json({ error: 'You cannot submit an offer to your own request' });
-    }
+    if (loanReq.status !== 'OPEN') return res.status(400).json({ error: 'Loan request is not open for offers' });
+    if (loanReq.borrowerId === userId) return res.status(403).json({ error: 'You cannot submit an offer to your own request' });
     if (!isAllowedAmount(loanReq.amount)) {
-      return res
-        .status(400)
-        .json({ error: `Loan amount must be one of: ${ALLOWED_AMOUNTS.join(', ')}` });
+      return res.status(400).json({ error: `Loan amount must be one of: ${ALLOWED_AMOUNTS.join(', ')}` });
     }
 
     const rate = Number(interestRate);
     if (!Number.isFinite(rate) || rate < 0 || rate > 100) {
       return res.status(400).json({ error: 'Interest rate must be between 0 and 100%' });
     }
-    const cleanMsg = message ? String(message).slice(0, 1000) : null;
 
     const offer = await prisma.loanOffer.create({
       data: {
@@ -55,7 +36,7 @@ exports.submitLoanOffer = async (req, res) => {
         amount: Number(loanReq.amount),
         duration: Number(loanReq.duration),
         interestRate: rate,
-        message: cleanMsg,
+        message: message ? String(message).slice(0, 1000) : null,
       },
       include: { lender: { select: { id: true, name: true } } },
     });
@@ -67,29 +48,26 @@ exports.submitLoanOffer = async (req, res) => {
   }
 };
 
-/** GET /api/loans/:loanId/offers */
 exports.getLoanOffers = async (req, res) => {
   const { loanId } = req.params;
+
   try {
     const offers = await prisma.loanOffer.findMany({
       where: { loanRequestId: loanId },
       include: { lender: { select: { id: true, name: true } } },
       orderBy: { createdAt: 'desc' },
     });
-    res.status(200).json(offers);
+
+    return res.status(200).json(offers);
   } catch (err) {
     console.error('Error fetching loan offers:', err);
-    res.status(500).json({ error: 'Could not retrieve loan offers' });
+    return res.status(500).json({ error: 'Could not retrieve loan offers' });
   }
 };
 
-/**
- * GET /api/loans/offers/mine
- * Return OPEN loan requests where the current user has submitted an offer.
- * Includes the borrower info and the user’s own offer as `myOffer`.
- */
 exports.getMyOfferRequests = async (req, res) => {
   const userId = req.user.userId;
+
   try {
     const rows = await prisma.loanRequest.findMany({
       where: {
@@ -116,38 +94,32 @@ exports.getMyOfferRequests = async (req, res) => {
       orderBy: { createdAt: 'desc' },
     });
 
-    const items = rows.map((r) => ({
-      id: r.id,
-      status: r.status,
-      amount: r.amount,
-      duration: r.duration,
-      interestRate: r.interestRate,
-      purpose: r.purpose,
-      createdAt: r.createdAt,
-      borrower: r.borrower,
-      myOffer: r.loanOffers[0] || null,
-    }));
-
-    return res.json({ items });
-  } catch (e) {
-    console.error('getMyOfferRequests error:', e);
+    return res.json({
+      items: rows.map((r) => ({
+        id: r.id,
+        status: r.status,
+        amount: r.amount,
+        duration: r.duration,
+        interestRate: r.interestRate,
+        purpose: r.purpose,
+        createdAt: r.createdAt,
+        borrower: r.borrower,
+        myOffer: r.loanOffers[0] || null,
+      })),
+    });
+  } catch (err) {
+    console.error('getMyOfferRequests error:', err);
     return res.status(500).json({ error: 'Failed to load your offer requests' });
   }
 };
 
-/** POST /api/loans/offers/:offerId/accept  (BORROWER action)
- *  Creates the Loan and marks it ACCEPTED.
- *  Lender can later fund via POST /api/loans/:loanId/fund.
- */
 exports.acceptLoanOffer = async (req, res) => {
   const { offerId } = req.params;
   const userId = getUserId(req);
-  const r2 = (n) =>
-    Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
-  if (!userId) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+  const r2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
   try {
     const offer = await prisma.loanOffer.findUnique({
@@ -158,132 +130,103 @@ exports.acceptLoanOffer = async (req, res) => {
       },
     });
 
-    if (!offer) {
-      return res.status(404).json({ error: 'Loan offer not found' });
-    }
+    if (!offer) return res.status(404).json({ error: 'Loan offer not found' });
 
     const lr = offer.loanRequest;
-    if (!lr) {
-      return res
-        .status(500)
-        .json({ error: 'Offer missing loan request' });
-    }
+    if (!lr) return res.status(500).json({ error: 'Offer missing loan request' });
 
     if (String(lr.borrowerId) !== String(userId)) {
-      return res
-        .status(403)
-        .json({ error: 'Only the borrower can accept this offer' });
+      return res.status(403).json({ error: 'Only the borrower can accept this offer' });
     }
 
     if ((lr.status || 'OPEN').toUpperCase() !== 'OPEN') {
-      return res
-        .status(400)
-        .json({ error: 'Loan request is not open' });
+      return res.status(400).json({ error: 'Loan request is not open' });
     }
 
     if ((offer.status || 'OPEN').toUpperCase() !== 'OPEN') {
-      return res
-        .status(400)
-        .json({ error: 'Offer is not open' });
+      return res.status(400).json({ error: 'Offer is not open' });
     }
 
     const amount = Number(offer.amount);
     if (!Number.isFinite(amount) || amount <= 0) {
-      return res
-        .status(400)
-        .json({ error: 'Offer has invalid amount' });
+      return res.status(400).json({ error: 'Offer has invalid amount' });
     }
 
-          // Borrower receives loan proceeds into their PeerFund wallet.
-      // No saved funding method is required at acceptance.
-      // Saved ACH is only needed later for repayment or withdrawal.
-      await getWalletOrCreate(userId);
+    // Borrower receives loan proceeds into their PeerFund wallet.
+    // No saved funding card, debit card, or ACH bank is required at acceptance.
+    await getWalletOrCreate(userId);
 
-      // Make sure we don't already have a loan for this request
-      const existingLoan = await prisma.loan.findFirst({
-        where: { loanRequestId: offer.loanRequestId },
+    const existingLoan = await prisma.loan.findFirst({
+      where: { loanRequestId: offer.loanRequestId },
+    });
+
+    if (existingLoan) {
+      return res.status(400).json({ error: 'Loan already accepted for this request' });
+    }
+
+    const acceptanceTimestamp = new Date();
+
+    const termRatePct = (Number(offer.interestRate) || 0) + 2;
+    const termRate = termRatePct / 100;
+    const totalBaseRepayment = r2(amount * (1 + termRate));
+    const baseMonthlyPayment = r2(totalBaseRepayment / Number(offer.duration));
+
+    const repaymentPeerfundEach = offer.lender.isSuperUser
+      ? 0
+      : r2(baseMonthlyPayment * PEERFUND_FEE_RATE);
+
+    const repaymentBankingEach = r2(baseMonthlyPayment * BANKING_FEE_RATE);
+
+    const scheduleRows = [];
+    const due = new Date();
+
+    for (let i = 0; i < Number(offer.duration); i++) {
+      due.setMonth(due.getMonth() + 1);
+
+      const totalCharged = r2(
+        baseMonthlyPayment + repaymentBankingEach + repaymentPeerfundEach
+      );
+
+      scheduleRows.push({
+        loanId: '',
+        dueDate: new Date(due),
+        basePayment: baseMonthlyPayment,
+        bankingFee: repaymentBankingEach,
+        peerfundFee: repaymentPeerfundEach,
+        totalCharged,
+        amountDue: totalCharged,
+        amountPaid: 0,
+        status: 'PENDING',
       });
-      if (existingLoan) {
-        return res
-          .status(400)
-          .json({ error: 'Loan already accepted for this request' });
-      }
+    }
 
-      const acceptanceTimestamp = new Date();
+    const principalCents = Math.round(amount * 100);
+    const termMonths = Number(offer.duration);
+    const interestRateBps = Math.round(Number(offer.interestRate) * 100);
 
-      // Interest / schedule math
-      const termRatePct = (Number(offer.interestRate) || 0) + 2;
-      const termRate = termRatePct / 100;
-      const totalBaseRepayment = r2(amount * (1 + termRate));
-      const baseMonthlyPayment = r2(
-        totalBaseRepayment / Number(offer.duration)
-      );
+    const loan = await prisma.$transaction(async (tx) => {
+      const created = await tx.loan.create({
+        data: {
+          principalCents,
+          interestRateBps,
+          termMonths,
 
-      const repaymentPeerfundEach = offer.lender.isSuperUser
-        ? 0
-        : r2(baseMonthlyPayment * PEERFUND_FEE_RATE);
+          amount,
+          duration: termMonths,
+          interestRate: Number(offer.interestRate),
 
-      const repaymentBankingEach = r2(
-        baseMonthlyPayment * BANKING_FEE_RATE
-      );
+          borrowerId: lr.borrowerId,
+          lenderId: offer.lenderId,
+          loanRequestId: lr.id,
 
-      const scheduleRows = [];
-      let due = new Date();
+          status: 'ACCEPTED',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          disbursedAmount: 0,
+        },
+        include: { lender: true },
+      });
 
-      for (let i = 0; i < Number(offer.duration); i++) {
-        due.setMonth(due.getMonth() + 1);
-
-        const totalCharged = r2(
-          baseMonthlyPayment + repaymentBankingEach + repaymentPeerfundEach
-        );
-
-        scheduleRows.push({
-          loanId: '', // will be filled in after create
-          dueDate: new Date(due),
-          basePayment: baseMonthlyPayment,
-          bankingFee: repaymentBankingEach,
-          peerfundFee: repaymentPeerfundEach,
-          totalCharged,
-          amountDue: totalCharged,
-          amountPaid: 0,
-          status: 'PENDING',
-        });
-      }
-
-      const principalCents = Math.round(amount * 100);
-      const termMonths = Number(offer.duration);
-      const interestRateBps = Math.round(
-        Number(offer.interestRate) * 100
-      );
-
-      const loan = await prisma.$transaction(async (tx) => {
-        // Create the loan
-        const created = await tx.loan.create({
-          data: {
-            // canonical
-            principalCents,
-            interestRateBps,
-            termMonths,
-
-            // legacy mirrors
-            amount,
-            duration: termMonths,
-            interestRate: Number(offer.interestRate),
-
-            borrowerId: lr.borrowerId,
-            lenderId: offer.lenderId,
-            loanRequestId: lr.id,
-
-            status: 'ACCEPTED',
-            createdAt: new Date(),
-            updatedAt: new Date(),
-
-            disbursedAmount: 0,
-          },
-          include: { lender: true },
-        });
-
-      // Mark offer + request
       await tx.loanOffer.update({
         where: { id: offerId },
         data: {
@@ -306,7 +249,6 @@ exports.acceptLoanOffer = async (req, res) => {
         data: { status: 'CLOSED', offerAccepted: true },
       });
 
-      // Simple text contract
       const contractContent = `Loan Contract Agreement
 
 Borrower: ${lr.borrower?.name || 'Borrower'}
@@ -345,75 +287,58 @@ Accepted At: ${acceptanceTimestamp.toISOString()}`;
         },
       });
 
-      const rowsWithLoanId = scheduleRows.map((r) => ({
-        ...r,
-        loanId: created.id,
-      }));
-
-      await tx.repayment.createMany({ data: rowsWithLoanId });
+      await tx.repayment.createMany({
+        data: scheduleRows.map((row) => ({
+          ...row,
+          loanId: created.id,
+        })),
+      });
 
       return created;
     });
 
     return res.status(201).json({
-      message:
-        'Loan accepted and contract saved. Waiting for lender to fund.',
+      message: 'Loan accepted and contract saved. Waiting for lender to fund.',
       loan,
     });
   } catch (err) {
     console.error('🔥 acceptLoanOffer error:', err);
-    return res
-      .status(500)
-      .json({ error: 'Could not accept offer' });
+    return res.status(500).json({ error: 'Could not accept offer' });
   }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/loans/:loanId/fund  (LENDER action, wallet → wallet only)
-//
-// 1) Debit lender's wallet.availableCents
-// 2) Credit borrower's wallet.availableCents
-// 3) (Best effort) create a Transaction row using *amount* (dollars)
-// 4) Mark loan FUNDED, set disbursedAmount (dollars) + updatedAt
-// ─────────────────────────────────────────────────────────────────────────────
 exports.fundLoanByLender = async (req, res) => {
   try {
-    console.log('💸 fundLoanByLender (wallet-only) hit');
+    console.log('💸 fundLoanByLender wallet-to-wallet hit');
 
     const lenderId = getUserId(req);
-    if (!lenderId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+    if (!lenderId) return res.status(401).json({ error: 'Unauthorized' });
 
     const { loanId } = req.params;
 
-    // Load the loan with borrower + lender
     const loan = await prisma.loan.findUnique({
       where: { id: loanId },
       include: { borrower: true, lender: true },
     });
 
-    if (!loan) {
-      return res.status(404).json({ error: 'Loan not found' });
-    }
+    if (!loan) return res.status(404).json({ error: 'Loan not found' });
 
     if (String(loan.lenderId) !== String(lenderId)) {
-      return res
-        .status(403)
-        .json({ error: 'Only the lender can fund this loan' });
+      return res.status(403).json({ error: 'Only the lender can fund this loan' });
     }
 
     const status = (loan.status || '').toUpperCase();
+
     if (status === 'FUNDED') {
       return res.status(409).json({ error: 'Loan already funded' });
     }
+
     if (status !== 'ACCEPTED') {
       return res.status(400).json({
-        error: 'Loan is not ready to fund (status must be ACCEPTED)',
+        error: 'Loan is not ready to fund. Status must be ACCEPTED.',
       });
     }
 
-    // Canonical amount in cents
     const principalCents = Number.isFinite(loan.principalCents)
       ? loan.principalCents
       : Math.round((loan.amount || 0) * 100);
@@ -422,50 +347,42 @@ exports.fundLoanByLender = async (req, res) => {
       return res.status(400).json({ error: 'Invalid principal amount' });
     }
 
-    // Dollars version (for Transaction + disbursedAmount)
     const principalDollars = principalCents / 100;
 
-    // Borrower does NOT need a funding card/ACH to accept.
-    // Accepting means they are receiving loan proceeds into their PeerFund wallet.
-    // Saved ACH should only be required later for repayment or withdrawal.
     const lenderWallet = await getWalletOrCreate(lenderId);
-    if (!lenderWallet) {
-      return res
-        .status(500)
-        .json({ error: 'Wallet not found for lender' });
-    }
+
     if (lenderWallet.availableCents < principalCents) {
       return res.status(400).json({
         code: 'INSUFFICIENT_WALLET_BALANCE',
-        error: 'Insufficient wallet balance to fund this loan',
+        error: 'You need enough available wallet balance to fund this loan.',
         availableCents: lenderWallet.availableCents,
         requiredCents: principalCents,
       });
     }
 
-    // Single DB transaction: debit lender, credit borrower, mark FUNDED
     await prisma.$transaction(async (tx) => {
-      // Re-read lender wallet inside tx
-      const w = await tx.wallet.findUnique({
+      const currentLenderWallet = await tx.wallet.findUnique({
         where: { id: lenderWallet.id },
       });
-      if (!w) throw new Error('Wallet not found in transaction.');
-      if (w.availableCents < principalCents) {
-        throw new Error(
-          'Insufficient wallet balance (checked inside transaction).'
-        );
+
+      if (!currentLenderWallet) {
+        throw new Error('Lender wallet not found in transaction');
       }
 
-      // 1) Debit lender wallet (cents)
-      const lenderNewBalance = w.availableCents - principalCents;
+      if (currentLenderWallet.availableCents < principalCents) {
+        throw new Error('Insufficient wallet balance inside transaction');
+      }
+
+      const lenderNewBalance = currentLenderWallet.availableCents - principalCents;
+
       await tx.wallet.update({
-        where: { id: w.id },
+        where: { id: currentLenderWallet.id },
         data: { availableCents: lenderNewBalance },
       });
 
       await tx.walletLedger.create({
         data: {
-          walletId: w.id,
+          walletId: currentLenderWallet.id,
           type: WalletEntryType.DISBURSE,
           amountCents: principalCents,
           direction: 'DEBIT',
@@ -481,7 +398,6 @@ exports.fundLoanByLender = async (req, res) => {
         },
       });
 
-      // 2) Ensure borrower wallet exists & credit it (cents)
       const borrowerWallet = await tx.wallet.upsert({
         where: { userId: loan.borrowerId },
         update: {},
@@ -492,8 +408,8 @@ exports.fundLoanByLender = async (req, res) => {
         },
       });
 
-      const borrowerNewBalance =
-        borrowerWallet.availableCents + principalCents;
+      const borrowerNewBalance = borrowerWallet.availableCents + principalCents;
+
       await tx.wallet.update({
         where: { id: borrowerWallet.id },
         data: { availableCents: borrowerNewBalance },
@@ -517,31 +433,25 @@ exports.fundLoanByLender = async (req, res) => {
         },
       });
 
-      // 3) BEST-EFFORT Transaction row (dollars, no direction field)
       try {
         await tx.transaction.create({
           data: {
             type: 'DISBURSEMENT',
-            amount: principalDollars, // dollars
+            amount: principalDollars,
             loanId: loan.id,
             fromUserId: lenderId,
             toUserId: loan.borrowerId,
           },
         });
-      } catch (e) {
-        console.warn(
-          '⚠️ transaction.create failed (non-fatal):',
-          e.message
-        );
-        // do NOT rethrow – funding should still succeed
+      } catch (err) {
+        console.warn('⚠️ transaction.create failed but funding continued:', err.message);
       }
 
-      // 4) Mark loan funded (no fundedAt field in your schema)
       await tx.loan.update({
         where: { id: loan.id },
         data: {
           status: 'FUNDED',
-          disbursedAmount: principalDollars, // dollars
+          disbursedAmount: principalDollars,
           updatedAt: new Date(),
         },
       });
