@@ -106,6 +106,12 @@ exports.getAllTransactions = async (req, res) => {
       .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
       .slice(0, limit);
 
+    console.log('ADMIN TX RESPONSE', {
+      transactionCount: transactions.length,
+      walletLedgerCount: ledgerRows.length,
+      combinedCount: combined.length,
+    });
+
     return res.json({
       isAdmin: true,
       count: combined.length,
