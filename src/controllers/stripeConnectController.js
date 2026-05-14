@@ -86,14 +86,52 @@ exports.createOnboardingLink = async (req, res) => {
 
     const accountId = await ensureConnectAccountFor(prisma, me);
 
-    const refreshUrl = req.body?.refreshUrl || `${API_ORIGIN}/api/stripe/onboarding/return`;
-    const returnUrl = req.body?.returnUrl || `${API_ORIGIN}/api/stripe/onboarding/return`;
+    const frontendOrigin = firstOrigin(
+      process.env.FRONTEND_ORIGIN,
+      'https://peerfundmarket.com'
+    );
 
-    const link = await createConnectOnboardingLink(accountId, refreshUrl, returnUrl);
-    return res.json({ url: link.url, accountId });
+    const refreshUrl =
+      req.body?.refreshUrl ||
+      `${frontendOrigin}/wallet?connect=refresh`;
+
+    const returnUrl =
+      req.body?.returnUrl ||
+      `${frontendOrigin}/wallet?connect=return`;
+
+    const link = await createConnectOnboardingLink(
+      accountId,
+      refreshUrl,
+      returnUrl
+    );
+
+    return res.json({
+      ok: true,
+      url: link.url,
+      accountId,
+    });
   } catch (err) {
-    console.error('createOnboardingLink error', err);
-    return res.status(500).json({ error: 'Failed to create onboarding link' });
+    const stripeMsg =
+      err?.raw?.message ||
+      err?.message ||
+      'Failed to create onboarding link';
+
+    const stripeCode = err?.raw?.code || err?.code || null;
+    const requestId = err?.raw?.requestId || err?.requestId || null;
+
+    console.error('createOnboardingLink error', {
+      message: stripeMsg,
+      code: stripeCode,
+      requestId,
+      type: err?.type,
+      stack: err?.stack,
+    });
+
+    return res.status(500).json({
+      error: stripeMsg,
+      code: stripeCode,
+      requestId,
+    });
   }
 };
 
