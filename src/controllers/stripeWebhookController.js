@@ -79,17 +79,179 @@ exports.handleStripeWebhook = async (req, res) => {
       }
 
       case 'payment_intent.succeeded': {
-        // For ACH this is "submitted/confirmed" — funds not necessarily available yet.
-        const pi = event.data.object;
-        const loanId = pi.metadata?.loanId;
-        if (loanId) {
-          await prisma.loan.update({
-            where: { id: loanId },
-            data: { status: 'PROCESSING', chargeId: pi.latest_charge || undefined },
-          });
+          const pi = event.data.object;
+
+          /**
+           * Wallet ACH deposit settlement:
+           * Move user's ACH deposit from pendingCents to availableCents.
+           */
+          if (pi.metadata?.purpose === 'wallet_deposit_ach') {
+            const walletId = pi.metadata?.walletId;
+            const userId = pi.metadata?.userId;
+            const netCents = Number(pi.metadata?.netCents || 0);
+            const peerfundFeeCents = Number(pi.metadata?.peerfundFeeCents || 0);
+            const processingFeeCents = Number(pi.metadata?.estimatedAchFeeCents || 0);
+
+            if (!walletId || !userId || !netCents) {
+              console.warn('ACH wallet deposit succeeded but missing metadata:', {
+                paymentIntentId: pi.id,
+                walletId,
+                userId,
+                netCents,
+              });
+              break;
+            }
+
+            const existingSettledLedger = await prisma.walletLedger.findFirst({
+              where: {
+                walletId,
+                type: 'DEPOSIT',
+                referenceType: 'StripePI',
+                metadata: {
+                  path: ['externalId'],
+                  equals: pi.id,
+                },
+              },
+            });
+
+            if (existingSettledLedger?.metadata?.status === 'ACH_SETTLED') {
+              console.log('ACH wallet deposit already settled:', pi.id);
+              break;
+            }
+
+            const pendingLedgerRows = await prisma.walletLedger.findMany({
+              where: {
+                walletId,
+                type: 'DEPOSIT',
+                referenceType: 'StripePI',
+              },
+              orderBy: { createdAt: 'desc' },
+              take: 100,
+            });
+
+            const pendingLedger =
+              pendingLedgerRows.find((row) => {
+                const meta = row.metadata || {};
+                return (
+                  meta.externalId === pi.id &&
+                  meta.method === 'ach' &&
+                  meta.pending === true
+                );
+              }) ||
+              pendingLedgerRows.find((row) => {
+                const meta = row.metadata || {};
+                return (
+                  meta.method === 'ach' &&
+                  meta.pending === true &&
+                  row.amountCents === netCents
+                );
+              });
+
+            if (!pendingLedger) {
+              console.warn('No pending wallet ledger found for ACH deposit:', {
+                paymentIntentId: pi.id,
+                walletId,
+                netCents,
+              });
+              break;
+            }
+
+            await prisma.$transaction(async (tx) => {
+              const currentWallet = await tx.wallet.findUnique({
+                where: { id: walletId },
+              });
+
+              if (!currentWallet) {
+                throw new Error(`Wallet not found during ACH settlement: ${walletId}`);
+              }
+
+              const pendingDecrement = Math.min(currentWallet.pendingCents, netCents);
+              const newAvailable = currentWallet.availableCents + netCents;
+
+              await tx.wallet.update({
+                where: { id: walletId },
+                data: {
+                  pendingCents: { decrement: pendingDecrement },
+                  availableCents: { increment: netCents },
+                },
+              });
+
+              await tx.walletLedger.update({
+                where: { id: pendingLedger.id },
+                data: {
+                  balanceAfterCents: newAvailable,
+                  metadata: {
+                    ...(pendingLedger.metadata || {}),
+                    pending: false,
+                    status: 'ACH_SETTLED',
+                    settledAt: new Date().toISOString(),
+                    stripeStatus: pi.status,
+                    paymentIntentId: pi.id,
+                  },
+                },
+              });
+
+              const feeRows = [];
+
+              if (peerfundFeeCents > 0) {
+                feeRows.push({
+                  type: 'PLATFORM_FEE',
+                  amount: peerfundFeeCents / 100,
+                  fromUserId: userId,
+                  toUserId: process.env.PLATFORM_FEE_USER_ID || undefined,
+                  peerfundFee: peerfundFeeCents / 100,
+                  bankingFee: 0,
+                  processedAt: new Date(),
+                  timestamp: new Date(),
+                });
+              }
+
+              if (processingFeeCents > 0) {
+                feeRows.push({
+                  type: 'ACH_FEE_RECOVERY',
+                  amount: processingFeeCents / 100,
+                  fromUserId: userId,
+                  toUserId: process.env.PLATFORM_FEE_USER_ID || undefined,
+                  peerfundFee: 0,
+                  bankingFee: processingFeeCents / 100,
+                  processedAt: new Date(),
+                  timestamp: new Date(),
+                });
+              }
+
+              if (feeRows.length) {
+                await tx.transaction.createMany({
+                  data: feeRows.filter((r) => !!r.toUserId),
+                });
+              }
+            });
+
+            console.log('✅ ACH wallet deposit settled from main Stripe webhook:', {
+              paymentIntentId: pi.id,
+              walletId,
+              netCents,
+            });
+
+            break;
+          }
+
+          /**
+           * Existing loan payment intent logic.
+           */
+          const loanId = pi.metadata?.loanId;
+
+          if (loanId) {
+            await prisma.loan.update({
+              where: { id: loanId },
+              data: {
+                status: 'PROCESSING',
+                chargeId: pi.latest_charge || undefined,
+              },
+            });
+          }
+
+          break;
         }
-        break;
-      }
 
       case 'payment_intent.payment_failed': {
         const pi = event.data.object;
