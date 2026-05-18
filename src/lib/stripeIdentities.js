@@ -118,6 +118,7 @@ async function ensureConnectAccountFor(prisma, user) {
     business_type: 'individual',
     capabilities: {
       transfers: { requested: true },
+      card_payments: { requested: true}
     },
     metadata: { appUserId: asMetaId(user.id) },
   });
