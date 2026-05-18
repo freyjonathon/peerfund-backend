@@ -176,7 +176,7 @@ app.use('/api/messages', messageRoutes);
 app.use('/api/repayments', repaymentRoutes);
 app.use('/api/payment-method', paymentMethodRoutes);
 app.use('/api/transactions', transactionRoutes);
-app.use('/api/notifications', notificationRoutes);
+app.use('/api', notificationRoutes);
 app.use('/api/documents', documentRoutes);
 app.use('/api/posts', postRoutes);
 app.use('/api/leaderboard', statsRoutes);
