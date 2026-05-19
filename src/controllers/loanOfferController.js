@@ -5,6 +5,7 @@ const { ALLOWED_AMOUNTS, isAllowedAmount } = require('../utils/loanTiers');
 const { getUserId } = require('../middleware/authMiddleware');
 const { WalletEntryType } = require('@prisma/client');
 const { getWalletOrCreate } = require('../utils/wallet');
+const { stripe } = require('../lib/stripeIdentities');
 
 exports.submitLoanOffer = async (req, res) => {
   const { loanId } = req.params;
@@ -18,10 +19,16 @@ exports.submitLoanOffer = async (req, res) => {
     });
 
     if (!loanReq) return res.status(404).json({ error: 'Loan request not found' });
-    if (loanReq.status !== 'OPEN') return res.status(400).json({ error: 'Loan request is not open for offers' });
-    if (loanReq.borrowerId === userId) return res.status(403).json({ error: 'You cannot submit an offer to your own request' });
+    if (loanReq.status !== 'OPEN') {
+      return res.status(400).json({ error: 'Loan request is not open for offers' });
+    }
+    if (loanReq.borrowerId === userId) {
+      return res.status(403).json({ error: 'You cannot submit an offer to your own request' });
+    }
     if (!isAllowedAmount(loanReq.amount)) {
-      return res.status(400).json({ error: `Loan amount must be one of: ${ALLOWED_AMOUNTS.join(', ')}` });
+      return res.status(400).json({
+        error: `Loan amount must be one of: ${ALLOWED_AMOUNTS.join(', ')}`,
+      });
     }
 
     const rate = Number(interestRate);
@@ -152,8 +159,8 @@ exports.acceptLoanOffer = async (req, res) => {
       return res.status(400).json({ error: 'Offer has invalid amount' });
     }
 
-    // Borrower receives loan proceeds into their PeerFund wallet.
-    // No saved funding card, debit card, or ACH bank is required at acceptance.
+    // Borrower will receive proceeds into PeerFund wallet after lender funds directly
+    // from a saved payment method. Borrower does not need a funding method at acceptance.
     await getWalletOrCreate(userId);
 
     const existingLoan = await prisma.loan.findFirst({
@@ -307,12 +314,28 @@ Accepted At: ${acceptanceTimestamp.toISOString()}`;
   }
 };
 
+/**
+ * POST /api/loans/:loanId/fund
+ *
+ * New PeerFund funding model:
+ * - Lender does NOT need to pre-deposit into PeerFund wallet.
+ * - Lender is charged directly using saved ACH/card payment method.
+ * - Borrower receives funded amount into PeerFund wallet.
+ * - Borrower can withdraw later through Stripe Connect payout setup.
+ */
 exports.fundLoanByLender = async (req, res) => {
   try {
-    console.log('💸 fundLoanByLender wallet-to-wallet hit');
+    console.log('💸 fundLoanByLender direct-payment-to-borrower-wallet hit');
 
     const lenderId = getUserId(req);
     if (!lenderId) return res.status(401).json({ error: 'Unauthorized' });
+
+    if (!stripe) {
+      return res.status(500).json({
+        code: 'STRIPE_NOT_CONFIGURED',
+        error: 'Stripe is not configured on the server.',
+      });
+    }
 
     const { loanId } = req.params;
 
@@ -333,6 +356,15 @@ exports.fundLoanByLender = async (req, res) => {
       return res.status(409).json({ error: 'Loan already funded' });
     }
 
+    if (status === 'PROCESSING') {
+      return res.status(202).json({
+        ok: true,
+        status: 'PROCESSING',
+        message: 'Funding payment is already processing.',
+        loan,
+      });
+    }
+
     if (status !== 'ACCEPTED') {
       return res.status(400).json({
         error: 'Loan is not ready to fund. Status must be ACCEPTED.',
@@ -349,55 +381,134 @@ exports.fundLoanByLender = async (req, res) => {
 
     const principalDollars = principalCents / 100;
 
-    const lenderWallet = await getWalletOrCreate(lenderId);
+    const lender = await prisma.user.findUnique({
+      where: { id: lenderId },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        stripeCustomerId: true,
+        fundingPaymentMethodId: true,
+      },
+    });
 
-    if (lenderWallet.availableCents < principalCents) {
+    if (!lender) {
+      return res.status(404).json({ error: 'Lender not found' });
+    }
+
+    let paymentMethodId = lender.fundingPaymentMethodId || null;
+    let stripeCustomerId = lender.stripeCustomerId || null;
+    let paymentMethodSource = 'USER_FUNDING_CARD';
+
+    if (!paymentMethodId) {
+      const savedAch = await prisma.paymentMethod.findFirst({
+        where: {
+          userId: lenderId,
+          type: 'US_BANK',
+          status: 'ACTIVE',
+          isDefaultCharge: true,
+        },
+        orderBy: { createdAt: 'desc' },
+        select: {
+          stripePaymentMethodId: true,
+          stripeCustomerId: true,
+        },
+      });
+
+      if (savedAch?.stripePaymentMethodId) {
+        paymentMethodId = savedAch.stripePaymentMethodId;
+        stripeCustomerId = savedAch.stripeCustomerId || stripeCustomerId;
+        paymentMethodSource = 'SAVED_ACH';
+      }
+    }
+
+    if (!stripeCustomerId || !paymentMethodId) {
       return res.status(400).json({
-        code: 'INSUFFICIENT_WALLET_BALANCE',
-        error: 'You need enough available wallet balance to fund this loan.',
-        availableCents: lenderWallet.availableCents,
-        requiredCents: principalCents,
+        code: 'MISSING_LENDER_FUNDING_METHOD',
+        error:
+          'Please save a funding method before funding this loan. You can use your saved ACH bank account or funding card.',
+      });
+    }
+
+    let paymentMethod;
+    try {
+      paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId);
+    } catch (err) {
+      console.error('Could not retrieve lender payment method:', err);
+      return res.status(400).json({
+        code: 'INVALID_LENDER_PAYMENT_METHOD',
+        error: 'The saved funding method could not be verified. Please re-save your payment method.',
+      });
+    }
+
+    const paymentMethodType = paymentMethod?.type || 'card';
+
+    let pi;
+    try {
+      pi = await stripe.paymentIntents.create(
+        {
+          amount: principalCents,
+          currency: 'usd',
+          customer: stripeCustomerId,
+          payment_method: paymentMethodId,
+          confirm: true,
+          off_session: true,
+          payment_method_types: [paymentMethodType],
+          description: `PeerFund loan funding for loan ${loan.id}`,
+          metadata: {
+            purpose: 'LOAN_FUNDING',
+            loanId: loan.id,
+            lenderId,
+            borrowerId: loan.borrowerId,
+            principalCents: String(principalCents),
+            paymentMethodSource,
+          },
+        },
+        {
+          idempotencyKey: `peerfund-loan-funding-${loan.id}`,
+        }
+      );
+    } catch (err) {
+      console.error('Stripe loan funding payment failed:', err);
+
+      return res.status(400).json({
+        code: err?.code || err?.raw?.code || 'LOAN_FUNDING_PAYMENT_FAILED',
+        error:
+          err?.raw?.message ||
+          err?.message ||
+          'Unable to charge the lender funding method.',
+      });
+    }
+
+    if (pi.status === 'processing') {
+      await prisma.loan.update({
+        where: { id: loan.id },
+        data: {
+          status: 'PROCESSING',
+          updatedAt: new Date(),
+        },
+      });
+
+      return res.status(202).json({
+        ok: true,
+        status: 'PROCESSING',
+        message:
+          'Loan funding payment is processing. The borrower wallet will be credited once payment succeeds.',
+        paymentIntentId: pi.id,
+        loanId: loan.id,
+      });
+    }
+
+    if (pi.status !== 'succeeded') {
+      return res.status(400).json({
+        code: 'LOAN_FUNDING_NOT_SUCCEEDED',
+        error: `Loan funding payment did not succeed. Current Stripe status: ${pi.status}`,
+        paymentIntentId: pi.id,
+        stripeStatus: pi.status,
       });
     }
 
     await prisma.$transaction(async (tx) => {
-      const currentLenderWallet = await tx.wallet.findUnique({
-        where: { id: lenderWallet.id },
-      });
-
-      if (!currentLenderWallet) {
-        throw new Error('Lender wallet not found in transaction');
-      }
-
-      if (currentLenderWallet.availableCents < principalCents) {
-        throw new Error('Insufficient wallet balance inside transaction');
-      }
-
-      const lenderNewBalance = currentLenderWallet.availableCents - principalCents;
-
-      await tx.wallet.update({
-        where: { id: currentLenderWallet.id },
-        data: { availableCents: lenderNewBalance },
-      });
-
-      await tx.walletLedger.create({
-        data: {
-          walletId: currentLenderWallet.id,
-          type: WalletEntryType.DISBURSE,
-          amountCents: principalCents,
-          direction: 'DEBIT',
-          balanceAfterCents: lenderNewBalance,
-          referenceType: 'Loan',
-          referenceId: loan.id,
-          metadata: {
-            reason: 'LOAN_FUNDED_LENDER_DEBIT',
-            loanId: loan.id,
-            borrowerId: loan.borrowerId,
-            lenderId: loan.lenderId,
-          },
-        },
-      });
-
       const borrowerWallet = await tx.wallet.upsert({
         where: { userId: loan.borrowerId },
         update: {},
@@ -426,9 +537,13 @@ exports.fundLoanByLender = async (req, res) => {
           referenceId: loan.id,
           metadata: {
             reason: 'LOAN_FUNDED_BORROWER_CREDIT',
+            fundingModel: 'DIRECT_LENDER_PAYMENT_TO_BORROWER_WALLET',
+            stripePaymentIntentId: pi.id,
+            stripeStatus: pi.status,
             loanId: loan.id,
             borrowerId: loan.borrowerId,
             lenderId: loan.lenderId,
+            paymentMethodSource,
           },
         },
       });
@@ -441,6 +556,8 @@ exports.fundLoanByLender = async (req, res) => {
             loanId: loan.id,
             fromUserId: lenderId,
             toUserId: loan.borrowerId,
+            processedAt: new Date(),
+            timestamp: new Date(),
           },
         });
       } catch (err) {
@@ -455,6 +572,22 @@ exports.fundLoanByLender = async (req, res) => {
           updatedAt: new Date(),
         },
       });
+
+      await tx.notification.create({
+        data: {
+          userId: loan.borrowerId,
+          type: 'WALLET',
+          message: `💸 Your loan has been funded. $${principalDollars.toFixed(
+            2
+          )} is now available in your PeerFund wallet.`,
+          data: {
+            loanId: loan.id,
+            lenderId,
+            amountCents: principalCents,
+            stripePaymentIntentId: pi.id,
+          },
+        },
+      });
     });
 
     const updated = await prisma.loan.findUnique({
@@ -464,14 +597,22 @@ exports.fundLoanByLender = async (req, res) => {
     return res.json({
       ok: true,
       loan: updated,
+      payment: {
+        paymentIntentId: pi.id,
+        status: pi.status,
+        chargedCents: principalCents,
+        paymentMethodSource,
+      },
       disbursement: {
-        transferId: 'peerfund-internal-wallet',
+        transferId: 'peerfund-direct-payment-to-wallet',
         netCents: principalCents,
         platformFeeCents: 0,
       },
     });
   } catch (err) {
     console.error('fundLoanByLender error:', err);
-    return res.status(500).json({ error: 'Failed to fund loan' });
+    return res.status(500).json({
+      error: err?.message || 'Failed to fund loan',
+    });
   }
 };
