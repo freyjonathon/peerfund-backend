@@ -164,6 +164,8 @@ app.use(
 
 /* ---------------------------- Routes -------------------------------- */
 
+app.use('/api', inlineDiscussionRoutes);
+
 app.use('/api/auth', authRoutes);
 app.use('/api/admin', adminRoutes);
 
@@ -199,7 +201,6 @@ app.get('/api/debug/stripe-routes', (_req, res) => {
 // Stripe JSON routes
 app.use('/api/stripe', stripeRoutes);
 
-app.use('/api', inlineDiscussionRoutes);
 app.use('/api', verificationRoutes);
 app.use('/api/direct-requests', directRequestRoutes);
 app.use('/api/billing', billingRoutes);
