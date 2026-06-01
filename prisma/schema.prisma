@@ -590,3 +590,17 @@ model WalletHold {
 
   @@index([walletId, createdAt])
 }
+
+model CareerApplication {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  name        String
+  email       String
+  phone       String?
+  linkedin    String?
+  role        String
+  whyPeerFund String?
+  resumePath  String?
+  resumeName  String?
+  status      String   @default("NEW")
+  createdAt   DateTime @default(now())
+}

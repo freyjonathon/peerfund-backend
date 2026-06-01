@@ -38,6 +38,7 @@ const verificationRoutes = require('./routes/verificationRoutes');
 const paymentsRoutes = require('./routes/payments');
 const directRequestRoutes = require('./routes/directRequestRoutes');
 const stripeRoutes = require('./routes/stripeRoutes');
+const careerApplicationRoutes = require('./routes/careerApplicationRoutes');
 
 // Admin transactions
 const adminTransactionRoutes = require('./routes/adminTransactionRoutes');
@@ -182,6 +183,7 @@ app.use('/api/documents', documentRoutes);
 app.use('/api/posts', postRoutes);
 app.use('/api/leaderboard', statsRoutes);
 app.use('/api/loanMessages', loanMessageRoutes);
+app.use('/api', careerApplicationRoutes);
 
 app.get('/api/debug/stripe-routes', (_req, res) => {
   res.json(
