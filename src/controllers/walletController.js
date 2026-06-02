@@ -719,8 +719,7 @@ exports.withdrawFunds = async (req, res) => {
       return res.status(400).json({
         ok: false,
         code: 'PAYOUTS_NOT_ENABLED',
-        error:
-          'Your payout account is not ready for payouts yet. Please check your Stripe onboarding status.',
+        error: 'Your payout account is not ready for payouts yet.',
         requirements_due: acct.requirements?.currently_due || [],
       });
     }
@@ -730,8 +729,32 @@ exports.withdrawFunds = async (req, res) => {
     if (wallet.availableCents < amountCents) {
       return res.status(400).json({
         ok: false,
-        error: 'Insufficient wallet balance for withdrawal',
-        availableCents: wallet.availableCents,
+        code: 'INSUFFICIENT_WALLET_BALANCE',
+        error: 'Insufficient PeerFund wallet balance for withdrawal.',
+        walletAvailableCents: wallet.availableCents,
+        requiredCents: amountCents,
+      });
+    }
+
+    const stripeBalance = await stripe.balance.retrieve();
+
+    const stripeAvailableUsdCents = (stripeBalance.available || [])
+      .filter((b) => b.currency === 'usd')
+      .reduce((sum, b) => sum + Number(b.amount || 0), 0);
+
+    const stripePendingUsdCents = (stripeBalance.pending || [])
+      .filter((b) => b.currency === 'usd')
+      .reduce((sum, b) => sum + Number(b.amount || 0), 0);
+
+    if (stripeAvailableUsdCents < amountCents) {
+      return res.status(400).json({
+        ok: false,
+        code: 'INSUFFICIENT_STRIPE_AVAILABLE_BALANCE',
+        error:
+          'Your PeerFund wallet shows funds, but Stripe funds are not available for withdrawal yet. Please try again after the payment settles.',
+        walletAvailableCents: wallet.availableCents,
+        stripeAvailableCents: stripeAvailableUsdCents,
+        stripePendingCents: stripePendingUsdCents,
         requiredCents: amountCents,
       });
     }
@@ -748,6 +771,16 @@ exports.withdrawFunds = async (req, res) => {
     });
 
     const updatedWallet = await prisma.$transaction(async (tx) => {
+      const currentWallet = await tx.wallet.findUnique({
+        where: { id: wallet.id },
+      });
+
+      if (!currentWallet || currentWallet.availableCents < amountCents) {
+        const err = new Error('INSUFFICIENT_WALLET_BALANCE');
+        err.code = 'INSUFFICIENT_WALLET_BALANCE';
+        throw err;
+      }
+
       const updated = await tx.wallet.update({
         where: { id: wallet.id },
         data: {
@@ -763,12 +796,14 @@ exports.withdrawFunds = async (req, res) => {
           direction: 'DEBIT',
           balanceAfterCents: updated.availableCents,
           referenceType: 'StripeTransfer',
-          referenceId: null,
+          referenceId: transfer.id,
           metadata: {
             provider: 'stripe',
             status: 'TRANSFER_CREATED',
             transferId: transfer.id,
             destinationAccountId: user.stripeAccountId,
+            stripeAvailableBeforeCents: stripeAvailableUsdCents,
+            stripePendingBeforeCents: stripePendingUsdCents,
           },
         },
       });
@@ -783,9 +818,18 @@ exports.withdrawFunds = async (req, res) => {
       available: updatedWallet.availableCents / 100,
       pending: updatedWallet.pendingCents / 100,
       transferId: transfer.id,
+      stripeAvailableBeforeCents: stripeAvailableUsdCents,
     });
   } catch (err) {
     console.error('withdrawFunds error:', err);
+
+    if (err.code === 'INSUFFICIENT_WALLET_BALANCE') {
+      return res.status(400).json({
+        ok: false,
+        code: 'INSUFFICIENT_WALLET_BALANCE',
+        error: 'Insufficient PeerFund wallet balance for withdrawal.',
+      });
+    }
 
     return res.status(500).json({
       ok: false,
