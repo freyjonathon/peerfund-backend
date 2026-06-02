@@ -127,7 +127,6 @@ const upgradeToSuperUser = async (req, res) => {
   const userId = req.user.userId;
 
   try {
-    // Basic config validation
     if (!stripe) {
       console.error('[SuperUser] Stripe client not initialised – missing STRIPE_SECRET_KEY');
       return res
@@ -142,14 +141,13 @@ const upgradeToSuperUser = async (req, res) => {
         .json({ error: 'SuperUser price is not configured on the server.' });
     }
 
-    // NOTE: only selecting fields that actually exist on User
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: {
         id: true,
         email: true,
         stripeCustomerId: true,
-        fundingPaymentMethodId: true, // your saved Stripe payment method
+        fundingPaymentMethodId: true,
         isSuperUser: true,
         subscriptionStatus: true,
       },
@@ -159,25 +157,18 @@ const upgradeToSuperUser = async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Safety check – backend agrees there is a funding card
-    if (!user.fundingPaymentMethodId) {
-      return res
-        .status(400)
-        .json({ error: 'No funding card on file. Please add one in your Wallet first.' });
-    }
-
-    // If they are already a SuperUser, short-circuit
     if (user.isSuperUser && user.subscriptionStatus === 'ACTIVE') {
       return res.json({ ok: true, alreadySuperUser: true });
     }
 
-    // Ensure Stripe customer exists
     let customerId = user.stripeCustomerId;
+
     if (!customerId) {
       const customer = await stripe.customers.create({
         email: user.email || undefined,
         metadata: { userId },
       });
+
       customerId = customer.id;
 
       await prisma.user.update({
@@ -186,36 +177,105 @@ const upgradeToSuperUser = async (req, res) => {
       });
     }
 
-    // Create subscription - Stripe will auto-bill monthly
-const subscription = await stripe.subscriptions.create({
-  customer: customerId,
-  items: [{ price: SUPERUSER_PRICE_ID }],
-  default_payment_method: user.fundingPaymentMethodId,
-  expand: ['latest_invoice.payment_intent'],
-});
+    let paymentMethodId = user.fundingPaymentMethodId || null;
+    let paymentMethodSource = paymentMethodId ? 'USER_FUNDING_METHOD_FIELD' : null;
 
-// Update user + log a transaction
-await prisma.$transaction(async (tx) => {
-  await tx.user.update({
-    where: { id: userId },
-    data: {
-      isSuperUser: true,
-      subscriptionStatus: 'ACTIVE',
-      superUserSince: new Date(),
-    },
-  });
+    if (!paymentMethodId) {
+      const savedPaymentMethod = await prisma.paymentMethod.findFirst({
+        where: {
+          userId,
+          status: 'ACTIVE',
+          type: 'US_BANK',
+          isDefaultCharge: true,
+        },
+        orderBy: { createdAt: 'desc' },
+        select: {
+          stripePaymentMethodId: true,
+          stripeCustomerId: true,
+        },
+      });
 
-  // Log in transaction history (same pattern as wallet upgrade)
-  await tx.transaction.create({
-    data: {
-      type: 'SUPERUSER_SUBSCRIPTION',
-      amount: 1.0,        // $1.00 subscription
-      fromUserId: userId, // charged user
-    },
-  });
-});
+      if (savedPaymentMethod?.stripePaymentMethodId) {
+        paymentMethodId = savedPaymentMethod.stripePaymentMethodId;
+        paymentMethodSource = 'PAYMENT_METHOD_TABLE_DEFAULT_ACH';
 
-    return res.json({ ok: true, subscriptionId: subscription.id });
+        if (!customerId && savedPaymentMethod.stripeCustomerId) {
+          customerId = savedPaymentMethod.stripeCustomerId;
+        }
+      }
+    }
+
+    if (!paymentMethodId) {
+      return res.status(400).json({
+        error:
+          'No saved payment method found. Please add a payment method in your Wallet first.',
+      });
+    }
+
+    const pm = await stripe.paymentMethods.retrieve(paymentMethodId);
+
+    if (!pm) {
+      return res.status(400).json({
+        error: 'Saved payment method could not be verified. Please re-link your payment method.',
+      });
+    }
+
+    if (!pm.customer) {
+      await stripe.paymentMethods.attach(paymentMethodId, {
+        customer: customerId,
+      });
+    } else if (pm.customer !== customerId) {
+      return res.status(400).json({
+        error:
+          'Saved payment method belongs to another Stripe customer. Please re-link your payment method.',
+      });
+    }
+
+    await stripe.customers.update(customerId, {
+      invoice_settings: {
+        default_payment_method: paymentMethodId,
+      },
+    });
+
+    const subscription = await stripe.subscriptions.create({
+      customer: customerId,
+      items: [{ price: SUPERUSER_PRICE_ID }],
+      default_payment_method: paymentMethodId,
+      metadata: {
+        userId,
+        purpose: 'SUPERUSER_SUBSCRIPTION',
+        paymentMethodSource,
+      },
+      expand: ['latest_invoice.payment_intent'],
+    });
+
+    await prisma.$transaction(async (tx) => {
+      await tx.user.update({
+        where: { id: userId },
+        data: {
+          isSuperUser: true,
+          subscriptionStatus: 'ACTIVE',
+          superUserSince: new Date(),
+          stripeCustomerId: customerId,
+        },
+      });
+
+      await tx.transaction.create({
+        data: {
+          type: 'SUPERUSER_SUBSCRIPTION',
+          amount: 1.0,
+          fromUserId: userId,
+          processedAt: new Date(),
+          timestamp: new Date(),
+        },
+      });
+    });
+
+    return res.json({
+      ok: true,
+      subscriptionId: subscription.id,
+      paymentMethodSource,
+    });
   } catch (error) {
     console.error('UpgradeToSuperUser error:', {
       message: error.message,
@@ -233,9 +293,6 @@ await prisma.$transaction(async (tx) => {
   }
 };
 
-/**
- * Upgrade to SuperUser by charging $1 from the user's PeerFund wallet.
- */
 const upgradeSuperuserFromWallet = async (req, res) => {
   const userId = req.user.userId;
   const SUBSCRIPTION_CENTS = 100; // $1.00
