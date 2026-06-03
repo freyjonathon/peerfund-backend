@@ -337,12 +337,14 @@ exports.payNextRepayment = async (req, res) => {
   try {
     const borrowerId = req.user.userId;
     const { loanId } = req.params;
-    const { paymentSource = 'wallet' } = req.body || {};
+
+    // DEFAULT NOW = saved payment method
+    const { paymentSource = 'saved_payment_method' } = req.body || {};
 
     const normalizedSource =
-      paymentSource === 'card' || paymentSource === 'funding_card'
-        ? 'card'
-        : 'wallet';
+      paymentSource === 'wallet'
+        ? 'wallet'
+        : 'saved_payment_method';
 
     console.log('🔔 payNextRepayment called', {
       loanId,
@@ -364,7 +366,11 @@ exports.payNextRepayment = async (req, res) => {
             fundingPaymentMethodId: true,
           },
         },
-        lender: { select: { id: true } },
+        lender: {
+          select: {
+            id: true,
+          },
+        },
       },
     });
 
@@ -373,7 +379,10 @@ exports.payNextRepayment = async (req, res) => {
     }
 
     const next = await prisma.repayment.findFirst({
-      where: { loanId: loan.id, status: 'PENDING' },
+      where: {
+        loanId: loan.id,
+        status: 'PENDING',
+      },
       orderBy: { dueDate: 'asc' },
       select: {
         id: true,
@@ -386,12 +395,15 @@ exports.payNextRepayment = async (req, res) => {
     });
 
     if (!next) {
-      return res.status(400).json({ error: 'No pending repayment' });
+      return res.status(400).json({
+        error: 'No pending repayment',
+      });
     }
 
     const base = Number(next.basePayment) || 0;
 
-    let { peerfundFee, bankingFee, totalFees, totalCharge } = calcFees(base);
+    let { peerfundFee, bankingFee, totalFees, totalCharge } =
+      calcFees(base);
 
     if (loan.borrower.isSuperUser) {
       peerfundFee = 0;
@@ -400,82 +412,198 @@ exports.payNextRepayment = async (req, res) => {
     }
 
     const finalPeerfund =
-      typeof next.peerfundFee === 'number' ? next.peerfundFee : r2(peerfundFee);
+      typeof next.peerfundFee === 'number'
+        ? next.peerfundFee
+        : r2(peerfundFee);
 
     const finalBanking =
-      typeof next.bankingFee === 'number' ? next.bankingFee : r2(bankingFee);
+      typeof next.bankingFee === 'number'
+        ? next.bankingFee
+        : r2(bankingFee);
 
     const finalTotal =
-      typeof next.totalCharged === 'number' && next.totalCharged > 0
+      typeof next.totalCharged === 'number' &&
+      next.totalCharged > 0
         ? next.totalCharged
         : r2(base + finalPeerfund + finalBanking);
 
     const finalTotalCents = dollarsToCents(finalTotal);
 
     let stripePaymentIntent = null;
-    let cardGross = null;
 
-    if (normalizedSource === 'card') {
+    // =========================================================
+    // SAVED PAYMENT METHOD FLOW (DEFAULT)
+    // =========================================================
+
+    if (normalizedSource === 'saved_payment_method') {
       if (!stripe) {
-        return res.status(500).json({ error: 'Stripe not configured' });
-      }
-
-      if (!loan.borrower?.stripeCustomerId || !loan.borrower?.fundingPaymentMethodId) {
-        return res.status(400).json({
-          error: 'No saved funding card found. Please save a funding card in your Wallet.',
+        return res.status(500).json({
+          error: 'Stripe not configured',
         });
       }
 
-      cardGross = grossUpForStripeCard(finalTotalCents);
+      let stripeCustomerId =
+        loan.borrower?.stripeCustomerId || null;
 
-      stripePaymentIntent = await stripe.paymentIntents.create({
-        amount: cardGross.grossCents,
-        currency: 'usd',
-        customer: loan.borrower.stripeCustomerId,
-        payment_method: loan.borrower.fundingPaymentMethodId,
-        off_session: true,
-        confirm: true,
-        metadata: {
-          borrowerId,
-          loanId,
-          repaymentId: next.id,
-          purpose: 'loan_repayment',
-          netRepaymentCents: String(cardGross.netCents),
-          grossChargeCents: String(cardGross.grossCents),
-          estimatedStripeFeeCents: String(cardGross.estimatedStripeFeeCents),
-        },
-      });
+      let paymentMethodId =
+        loan.borrower?.fundingPaymentMethodId || null;
 
-      if (stripePaymentIntent.status !== 'succeeded') {
+      // ACH fallback from PaymentMethod table
+      if (!paymentMethodId) {
+        const savedAch = await prisma.paymentMethod.findFirst({
+          where: {
+            userId: borrowerId,
+            type: 'US_BANK',
+            status: 'ACTIVE',
+            isDefaultCharge: true,
+          },
+          orderBy: { createdAt: 'desc' },
+          select: {
+            stripePaymentMethodId: true,
+            stripeCustomerId: true,
+          },
+        });
+
+        if (savedAch?.stripePaymentMethodId) {
+          paymentMethodId = savedAch.stripePaymentMethodId;
+
+          stripeCustomerId =
+            savedAch.stripeCustomerId ||
+            stripeCustomerId;
+        }
+      }
+
+      if (!stripeCustomerId || !paymentMethodId) {
         return res.status(400).json({
-          error: `PaymentIntent not succeeded (status=${stripePaymentIntent.status})`,
+          code: 'NO_PAYMENT_METHOD',
+          error:
+            'Please save a payment method before making a repayment.',
+        });
+      }
+
+      let paymentMethod;
+
+      try {
+        paymentMethod =
+          await stripe.paymentMethods.retrieve(
+            paymentMethodId
+          );
+      } catch (err) {
+        console.error(
+          'Could not retrieve repayment payment method:',
+          err
+        );
+
+        return res.status(400).json({
+          code: 'INVALID_PAYMENT_METHOD',
+          error:
+            'The saved payment method could not be verified. Please re-save your bank account.',
+        });
+      }
+
+      const paymentMethodType =
+        paymentMethod?.type || 'us_bank_account';
+
+      try {
+        stripePaymentIntent =
+          await stripe.paymentIntents.create({
+            amount: finalTotalCents,
+            currency: 'usd',
+            customer: stripeCustomerId,
+            payment_method: paymentMethodId,
+            payment_method_types: [paymentMethodType],
+            off_session: true,
+            confirm: true,
+
+            description: `PeerFund repayment for loan ${loan.id}`,
+
+            metadata: {
+              borrowerId,
+              lenderId: loan.lenderId,
+              loanId,
+              repaymentId: next.id,
+              purpose: 'loan_repayment',
+              baseCents: String(
+                dollarsToCents(base)
+              ),
+              peerfundFeeCents: String(
+                dollarsToCents(finalPeerfund)
+              ),
+              bankingFeeCents: String(
+                dollarsToCents(finalBanking)
+              ),
+            },
+          });
+      } catch (err) {
+        console.error(
+          'Stripe repayment payment failed:',
+          err
+        );
+
+        return res.status(400).json({
+          code:
+            err?.code ||
+            err?.raw?.code ||
+            'REPAYMENT_PAYMENT_FAILED',
+
+          error:
+            err?.raw?.message ||
+            err?.message ||
+            'Unable to process repayment payment.',
+        });
+      }
+
+      // ACH may enter processing first
+      if (
+        stripePaymentIntent.status !== 'succeeded' &&
+        stripePaymentIntent.status !== 'processing'
+      ) {
+        return res.status(400).json({
+          code: 'PAYMENT_NOT_COMPLETED',
+          error: `Payment status: ${stripePaymentIntent.status}`,
         });
       }
     }
+
+    // =========================================================
+    // WALLET FLOW (OPTIONAL)
+    // =========================================================
 
     const paidAt = new Date();
 
     const result = await prisma.$transaction(async (tx) => {
       if (normalizedSource === 'wallet') {
-        const borrowerWallet = await tx.wallet.upsert({
-          where: { userId: borrowerId },
-          update: {},
-          create: {
-            userId: borrowerId,
-            availableCents: 0,
-            pendingCents: 0,
-          },
-        });
+        const borrowerWallet =
+          await tx.wallet.upsert({
+            where: { userId: borrowerId },
+            update: {},
+            create: {
+              userId: borrowerId,
+              availableCents: 0,
+              pendingCents: 0,
+            },
+          });
 
-        if (borrowerWallet.availableCents < finalTotalCents) {
-          throw new Error('Insufficient wallet balance');
+        if (
+          borrowerWallet.availableCents <
+          finalTotalCents
+        ) {
+          throw new Error(
+            'Insufficient wallet balance'
+          );
         }
 
-        const newBorrowerBal = borrowerWallet.availableCents - finalTotalCents;
+        const newBorrowerBal =
+          borrowerWallet.availableCents -
+          finalTotalCents;
 
         await tx.wallet.update({
-          where: { id: borrowerWallet.id },
-          data: { availableCents: newBorrowerBal },
+          where: {
+            id: borrowerWallet.id,
+          },
+          data: {
+            availableCents: newBorrowerBal,
+          },
         });
 
         await tx.walletLedger.create({
@@ -492,53 +620,86 @@ exports.payNextRepayment = async (req, res) => {
               repaymentId: next.id,
               reason: 'REPAYMENT_DEBIT',
               source: 'WALLET',
-              baseCents: dollarsToCents(base),
-              bankingFeeCents: dollarsToCents(finalBanking),
-              peerfundFeeCents: dollarsToCents(finalPeerfund),
             },
           },
         });
       }
 
+      // =========================================
+      // REPAYMENT RECORD
+      // =========================================
+
       const updated = await tx.repayment.update({
         where: { id: next.id },
         data: {
-          status: 'PAID',
+          status:
+            stripePaymentIntent?.status ===
+            'processing'
+              ? 'PROCESSING'
+              : 'PAID',
+
           paidAt,
+
           basePayment: base,
+
           peerfundFee: r2(finalPeerfund),
+
           bankingFee: r2(finalBanking),
+
           totalCharged: r2(finalTotal),
+
           amountPaid: r2(finalTotal),
         },
-        select: { id: true, status: true, paidAt: true, totalCharged: true },
+
+        select: {
+          id: true,
+          status: true,
+          paidAt: true,
+          totalCharged: true,
+        },
       });
 
-      await createRepaymentAccountingTx(tx, {
-        loan,
-        loanId,
-        repaymentId: next.id,
-        base,
-        finalBanking,
-        finalPeerfund,
-      });
+      // =========================================
+      // ONLY CREDIT LENDER IF REAL PAYMENT EXISTS
+      // =========================================
 
-      await applyWalletCreditsForRepaymentTx(tx, {
-        loan,
-        loanId,
-        base,
-        bankingFee: finalBanking,
-        platformFee: finalPeerfund,
-      });
+      if (
+        normalizedSource === 'wallet' ||
+        stripePaymentIntent?.status === 'succeeded' ||
+        stripePaymentIntent?.status === 'processing'
+      ) {
+        await createRepaymentAccountingTx(tx, {
+          loan,
+          loanId,
+          repaymentId: next.id,
+          base,
+          finalBanking,
+          finalPeerfund,
+        });
 
-      const remaining = await tx.repayment.count({
-        where: { loanId, status: 'PENDING' },
-      });
+        await applyWalletCreditsForRepaymentTx(tx, {
+          loan,
+          loanId,
+          base,
+          bankingFee: finalBanking,
+          platformFee: finalPeerfund,
+        });
+      }
+
+      const remaining =
+        await tx.repayment.count({
+          where: {
+            loanId,
+            status: 'PENDING',
+          },
+        });
 
       if (remaining === 0) {
         await tx.loan.update({
           where: { id: loanId },
-          data: { status: 'PAID_OFF' },
+          data: {
+            status: 'PAID_OFF',
+          },
         });
       }
 
@@ -547,24 +708,28 @@ exports.payNextRepayment = async (req, res) => {
 
     return res.json({
       ok: true,
+
       repaymentId: result.id,
+
       status: result.status,
+
       paidAt: result.paidAt,
+
       amount: result.totalCharged,
+
       paymentSource: normalizedSource,
-      stripePaymentIntentId: stripePaymentIntent?.id || null,
-      cardCharge:
-        cardGross && normalizedSource === 'card'
-          ? {
-              grossCents: cardGross.grossCents,
-              netRepaymentCents: cardGross.netCents,
-              estimatedStripeFeeCents: cardGross.estimatedStripeFeeCents,
-              totalFeeCents: cardGross.totalFeeCents,
-            }
-          : null,
+
+      stripePaymentIntentId:
+        stripePaymentIntent?.id || null,
+
+      stripeStatus:
+        stripePaymentIntent?.status || null,
     });
   } catch (err) {
-    console.error('💥 payNextRepayment error:', err);
+    console.error(
+      '💥 payNextRepayment error:',
+      err
+    );
 
     return res.status(500).json({
       error:
