@@ -448,30 +448,35 @@ exports.payNextRepayment = async (req, res) => {
       let paymentMethodId =
         loan.borrower?.fundingPaymentMethodId || null;
 
-      // ACH fallback from PaymentMethod table
-      if (!paymentMethodId) {
-        const savedAch = await prisma.paymentMethod.findFirst({
-          where: {
-            userId: borrowerId,
-            type: 'US_BANK',
-            status: 'ACTIVE',
-            isDefaultCharge: true,
-          },
-          orderBy: { createdAt: 'desc' },
-          select: {
-            stripePaymentMethodId: true,
-            stripeCustomerId: true,
-          },
-        });
+        // Fallback from PaymentMethod table
+            if (!paymentMethodId) {
+              const savedMethod = await prisma.paymentMethod.findFirst({
+                where: {
+                  userId: borrowerId,
+                  status: 'ACTIVE',
+                  isDefaultCharge: true,
+                },
+                orderBy: { createdAt: 'desc' },
+                select: {
+                  stripePaymentMethodId: true,
+                  stripeCustomerId: true,
+                  type: true,
+                },
+              });
 
-        if (savedAch?.stripePaymentMethodId) {
-          paymentMethodId = savedAch.stripePaymentMethodId;
+              if (savedMethod?.stripePaymentMethodId) {
+                paymentMethodId = savedMethod.stripePaymentMethodId;
 
-          stripeCustomerId =
-            savedAch.stripeCustomerId ||
-            stripeCustomerId;
-        }
-      }
+                stripeCustomerId =
+                  savedMethod.stripeCustomerId ||
+                  stripeCustomerId;
+
+                console.log('✅ Using saved repayment payment method', {
+                  type: savedMethod.type,
+                  paymentMethodId,
+                });
+              }
+            }
 
       if (!stripeCustomerId || !paymentMethodId) {
         return res.status(400).json({
