@@ -319,7 +319,7 @@ Accepted At: ${acceptanceTimestamp.toISOString()}`;
  *
  * New PeerFund funding model:
  * - Lender does NOT need to pre-deposit into PeerFund wallet.
- * - Lender is charged directly using saved ACH/card payment method.
+ * - Lender is charged directly using saved ACH/payment method.
  * - Borrower receives funded amount into PeerFund wallet.
  * - Borrower can withdraw later through Stripe Connect payout setup.
  */
@@ -396,66 +396,72 @@ exports.fundLoanByLender = async (req, res) => {
       return res.status(404).json({ error: 'Lender not found' });
     }
 
-    let paymentMethodId = lender.fundingPaymentMethodId || null;
+    let paymentMethodId = null;
     let stripeCustomerId = lender.stripeCustomerId || null;
-    let paymentMethodSource = 'USER_FUNDING_CARD';
+    let paymentMethodSource = 'UNKNOWN';
 
-    if (!paymentMethodId) {
-      const savedMethod = await prisma.paymentMethod.findFirst({
-        where: {
-          userId: lenderId,
-          status: 'ACTIVE',
-        },
-        orderBy: [
-          { isDefaultCharge: 'desc' },
-          { createdAt: 'desc' },
-        ],
-        select: {
-          stripePaymentMethodId: true,
-          stripeCustomerId: true,
-          type: true,
-        },
-      });
+    const savedMethod = await prisma.paymentMethod.findFirst({
+      where: {
+        userId: lenderId,
+        status: 'ACTIVE',
+      },
+      orderBy: [
+        { isDefaultCharge: 'desc' },
+        { createdAt: 'desc' },
+      ],
+      select: {
+        stripePaymentMethodId: true,
+        stripeCustomerId: true,
+        type: true,
+      },
+    });
 
-          if (savedMethod?.stripePaymentMethodId) {
+    if (savedMethod?.stripePaymentMethodId) {
       paymentMethodId = savedMethod.stripePaymentMethodId;
       stripeCustomerId = savedMethod.stripeCustomerId || stripeCustomerId;
       paymentMethodSource = savedMethod.type || 'SAVED_PAYMENT_METHOD';
-    }
+    } else if (lender.fundingPaymentMethodId) {
+      paymentMethodId = lender.fundingPaymentMethodId;
+      paymentMethodSource = 'USER_FUNDING_CARD';
     }
 
     if (!stripeCustomerId || !paymentMethodId) {
       return res.status(400).json({
         code: 'MISSING_LENDER_FUNDING_METHOD',
         error:
-          'Please save a funding method before funding this loan. You can use your saved ACH bank account or funding card.',
+          'Please save a payment method before funding this loan.',
       });
     }
 
     let paymentMethod;
+
     try {
       paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId);
     } catch (err) {
       console.error('Could not retrieve lender payment method:', err);
+
       return res.status(400).json({
         code: 'INVALID_LENDER_PAYMENT_METHOD',
-        error: 'The saved funding method could not be verified. Please re-save your payment method.',
+        error:
+          'The saved funding method could not be verified. Please re-save your payment method.',
       });
     }
 
-    const paymentMethodType = paymentMethod?.type || 'card';
+    const paymentMethodType = paymentMethod?.type || 'us_bank_account';
 
-      console.log('🧾 Creating Stripe loan funding PaymentIntent', {
-        loanId: loan.id,
-        lenderId,
-        borrowerId: loan.borrowerId,
-        principalCents,
-        stripeCustomerId,
-        paymentMethodId,
-        paymentMethodSource,
-      });
+    console.log('🧾 Creating Stripe loan funding PaymentIntent', {
+      loanId: loan.id,
+      lenderId,
+      borrowerId: loan.borrowerId,
+      principalCents,
+      stripeCustomerId,
+      paymentMethodId,
+      paymentMethodType,
+      paymentMethodSource,
+    });
 
     let pi;
+
     try {
       pi = await stripe.paymentIntents.create(
         {
@@ -474,6 +480,7 @@ exports.fundLoanByLender = async (req, res) => {
             borrowerId: loan.borrowerId,
             principalCents: String(principalCents),
             paymentMethodSource,
+            paymentMethodType,
           },
         },
         {
@@ -481,15 +488,20 @@ exports.fundLoanByLender = async (req, res) => {
         }
       );
 
-        console.log('✅ Stripe funding result', {
+      console.log('✅ Stripe funding result', {
         paymentIntentId: pi.id,
         status: pi.status,
         amount: pi.amount,
         currency: pi.currency,
       });
-
     } catch (err) {
-      console.error('Stripe loan funding payment failed:', err);
+      console.error('Stripe loan funding payment failed:', {
+        message: err?.message,
+        code: err?.code,
+        rawCode: err?.raw?.code,
+        rawMessage: err?.raw?.message,
+        type: err?.type,
+      });
 
       return res.status(400).json({
         code: err?.code || err?.raw?.code || 'LOAN_FUNDING_PAYMENT_FAILED',
@@ -543,7 +555,9 @@ exports.fundLoanByLender = async (req, res) => {
 
       await tx.wallet.update({
         where: { id: borrowerWallet.id },
-        data: { availableCents: borrowerNewBalance },
+        data: {
+          availableCents: borrowerNewBalance,
+        },
       });
 
       await tx.walletLedger.create({
@@ -564,6 +578,7 @@ exports.fundLoanByLender = async (req, res) => {
             borrowerId: loan.borrowerId,
             lenderId: loan.lenderId,
             paymentMethodSource,
+            paymentMethodType,
           },
         },
       });
@@ -605,6 +620,8 @@ exports.fundLoanByLender = async (req, res) => {
             lenderId,
             amountCents: principalCents,
             stripePaymentIntentId: pi.id,
+            paymentMethodSource,
+            paymentMethodType,
           },
         },
       });
@@ -622,6 +639,7 @@ exports.fundLoanByLender = async (req, res) => {
         status: pi.status,
         chargedCents: principalCents,
         paymentMethodSource,
+        paymentMethodType,
       },
       disbursement: {
         transferId: 'peerfund-direct-payment-to-wallet',
@@ -631,6 +649,7 @@ exports.fundLoanByLender = async (req, res) => {
     });
   } catch (err) {
     console.error('fundLoanByLender error:', err);
+
     return res.status(500).json({
       error: err?.message || 'Failed to fund loan',
     });
