@@ -396,46 +396,49 @@ exports.fundLoanByLender = async (req, res) => {
       return res.status(404).json({ error: 'Lender not found' });
     }
 
-    let paymentMethodId = null;
-    let stripeCustomerId = lender.stripeCustomerId || null;
-    let paymentMethodSource = 'UNKNOWN';
+      let paymentMethodId = null;
+      let stripeCustomerId = lender.stripeCustomerId || null;
+      let paymentMethodSource = 'SAVED_ACH';
 
-    const savedMethod = await prisma.paymentMethod.findFirst({
-      where: {
-        userId: lenderId,
-        status: 'ACTIVE',
-      },
-      orderBy: [
-        { isDefaultCharge: 'desc' },
-        { createdAt: 'desc' },
-      ],
-      select: {
-        stripePaymentMethodId: true,
-        stripeCustomerId: true,
-        type: true,
-      },
-    });
+      const savedAch = await prisma.paymentMethod.findFirst({
+        where: {
+          userId: lenderId,
+          type: 'US_BANK',
+          status: 'ACTIVE',
+        },
+        orderBy: [
+          { isDefaultCharge: 'desc' },
+          { createdAt: 'desc' },
+        ],
+        select: {
+          stripePaymentMethodId: true,
+          stripeCustomerId: true,
+          type: true,
+          bankName: true,
+          last4: true,
+        },
+      });
 
-          if (savedAch?.stripePaymentMethodId) {
+      console.log('🏦 Lender ACH lookup result', {
+        lenderId,
+        found: !!savedAch,
+        type: savedAch?.type,
+        bankName: savedAch?.bankName,
+        last4: savedAch?.last4,
+        stripePaymentMethodId: savedAch?.stripePaymentMethodId,
+      });
+
+      if (savedAch?.stripePaymentMethodId) {
         paymentMethodId = savedAch.stripePaymentMethodId;
         stripeCustomerId = savedAch.stripeCustomerId || stripeCustomerId;
-        paymentMethodSource = 'SAVED_ACH';
       }
 
       if (!stripeCustomerId || !paymentMethodId) {
         return res.status(400).json({
-          code: 'MISSING_ACH_FUNDING_METHOD',
+          code: 'MISSING_LENDER_ACH_METHOD',
           error: 'Please link a bank account before funding this loan.',
         });
       }
-
-    if (!stripeCustomerId || !paymentMethodId) {
-      return res.status(400).json({
-        code: 'MISSING_LENDER_FUNDING_METHOD',
-        error:
-          'Please save a payment method before funding this loan.',
-      });
-    }
 
     let paymentMethod;
 
