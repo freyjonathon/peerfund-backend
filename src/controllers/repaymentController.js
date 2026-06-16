@@ -454,9 +454,11 @@ exports.payNextRepayment = async (req, res) => {
                 where: {
                   userId: borrowerId,
                   status: 'ACTIVE',
-                  isDefaultCharge: true,
                 },
-                orderBy: { createdAt: 'desc' },
+                orderBy: [
+                  { isDefaultCharge: 'desc' },
+                  { createdAt: 'desc' },
+                ],
                 select: {
                   stripePaymentMethodId: true,
                   stripeCustomerId: true,
