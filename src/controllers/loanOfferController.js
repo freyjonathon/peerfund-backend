@@ -401,25 +401,27 @@ exports.fundLoanByLender = async (req, res) => {
     let paymentMethodSource = 'USER_FUNDING_CARD';
 
     if (!paymentMethodId) {
-      const savedAch = await prisma.paymentMethod.findFirst({
+      const savedMethod = await prisma.paymentMethod.findFirst({
         where: {
           userId: lenderId,
-          type: 'US_BANK',
           status: 'ACTIVE',
-          isDefaultCharge: true,
         },
-        orderBy: { createdAt: 'desc' },
+        orderBy: [
+          { isDefaultCharge: 'desc' },
+          { createdAt: 'desc' },
+        ],
         select: {
           stripePaymentMethodId: true,
           stripeCustomerId: true,
+          type: true,
         },
       });
 
-      if (savedAch?.stripePaymentMethodId) {
-        paymentMethodId = savedAch.stripePaymentMethodId;
-        stripeCustomerId = savedAch.stripeCustomerId || stripeCustomerId;
-        paymentMethodSource = 'SAVED_ACH';
-      }
+          if (savedMethod?.stripePaymentMethodId) {
+      paymentMethodId = savedMethod.stripePaymentMethodId;
+      stripeCustomerId = savedMethod.stripeCustomerId || stripeCustomerId;
+      paymentMethodSource = savedMethod.type || 'SAVED_PAYMENT_METHOD';
+    }
     }
 
     if (!stripeCustomerId || !paymentMethodId) {
@@ -442,6 +444,16 @@ exports.fundLoanByLender = async (req, res) => {
     }
 
     const paymentMethodType = paymentMethod?.type || 'card';
+
+      console.log('🧾 Creating Stripe loan funding PaymentIntent', {
+        loanId: loan.id,
+        lenderId,
+        borrowerId: loan.borrowerId,
+        principalCents,
+        stripeCustomerId,
+        paymentMethodId,
+        paymentMethodSource,
+      });
 
     let pi;
     try {
@@ -468,6 +480,14 @@ exports.fundLoanByLender = async (req, res) => {
           idempotencyKey: `peerfund-loan-funding-${loan.id}`,
         }
       );
+
+        console.log('✅ Stripe funding result', {
+        paymentIntentId: pi.id,
+        status: pi.status,
+        amount: pi.amount,
+        currency: pi.currency,
+      });
+
     } catch (err) {
       console.error('Stripe loan funding payment failed:', err);
 
