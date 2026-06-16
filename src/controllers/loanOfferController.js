@@ -416,14 +416,18 @@ exports.fundLoanByLender = async (req, res) => {
       },
     });
 
-    if (savedMethod?.stripePaymentMethodId) {
-      paymentMethodId = savedMethod.stripePaymentMethodId;
-      stripeCustomerId = savedMethod.stripeCustomerId || stripeCustomerId;
-      paymentMethodSource = savedMethod.type || 'SAVED_PAYMENT_METHOD';
-    } else if (lender.fundingPaymentMethodId) {
-      paymentMethodId = lender.fundingPaymentMethodId;
-      paymentMethodSource = 'USER_FUNDING_CARD';
-    }
+          if (savedAch?.stripePaymentMethodId) {
+        paymentMethodId = savedAch.stripePaymentMethodId;
+        stripeCustomerId = savedAch.stripeCustomerId || stripeCustomerId;
+        paymentMethodSource = 'SAVED_ACH';
+      }
+
+      if (!stripeCustomerId || !paymentMethodId) {
+        return res.status(400).json({
+          code: 'MISSING_ACH_FUNDING_METHOD',
+          error: 'Please link a bank account before funding this loan.',
+        });
+      }
 
     if (!stripeCustomerId || !paymentMethodId) {
       return res.status(400).json({
