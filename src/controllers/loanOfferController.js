@@ -491,7 +491,7 @@ exports.fundLoanByLender = async (req, res) => {
           },
         },
         {
-          idempotencyKey: `peerfund-loan-funding-${loan.id}`,
+            idempotencyKey: `peerfund-loan-funding-${loan.id}-${paymentMethodId}`,
         }
       );
 
