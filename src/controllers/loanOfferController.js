@@ -558,7 +558,20 @@ exports.fundLoanByLender = async (req, res) => {
         },
       });
 
-      const borrowerNewBalance = borrowerWallet.availableCents + principalCents;
+      const peerfundFeeCents = Math.round(principalCents * 0.01);
+      const bankingFeeCents = Math.round(principalCents * 0.01);
+
+      const netDisbursementCents =
+        principalCents - peerfundFeeCents - bankingFeeCents;
+
+      if (netDisbursementCents <= 0) {
+        throw new Error(
+          `Loan amount too small after fees. Principal=${principalCents}`
+        );
+      }
+
+      const borrowerNewBalance =
+        borrowerWallet.availableCents + netDisbursementCents;
 
       await tx.wallet.update({
         where: { id: borrowerWallet.id },
@@ -571,7 +584,7 @@ exports.fundLoanByLender = async (req, res) => {
         data: {
           walletId: borrowerWallet.id,
           type: WalletEntryType.DISBURSE,
-          amountCents: principalCents,
+          amountCents: netDisbursementCents,
           direction: 'CREDIT',
           balanceAfterCents: borrowerNewBalance,
           referenceType: 'Loan',
@@ -584,6 +597,10 @@ exports.fundLoanByLender = async (req, res) => {
             loanId: loan.id,
             borrowerId: loan.borrowerId,
             lenderId: loan.lenderId,
+            principalCents,
+            peerfundFeeCents,
+            bankingFeeCents,
+            netDisbursementCents,
             paymentMethodSource,
             paymentMethodType,
           },
@@ -610,7 +627,7 @@ exports.fundLoanByLender = async (req, res) => {
         where: { id: loan.id },
         data: {
           status: 'FUNDED',
-          disbursedAmount: principalDollars,
+          disbursedAmount: netDisbursementCents / 100,
           updatedAt: new Date(),
         },
       });
@@ -619,9 +636,9 @@ exports.fundLoanByLender = async (req, res) => {
         data: {
           userId: loan.borrowerId,
           type: 'WALLET',
-          message: `💸 Your loan has been funded. $${principalDollars.toFixed(
-            2
-          )} is now available in your PeerFund wallet.`,
+          message: `💸 Your loan has been funded. $${(
+            netDisbursementCents / 100
+          ).toFixed(2)} is now available in your PeerFund wallet.`,
           data: {
             loanId: loan.id,
             lenderId,
@@ -650,8 +667,10 @@ exports.fundLoanByLender = async (req, res) => {
       },
       disbursement: {
         transferId: 'peerfund-direct-payment-to-wallet',
-        netCents: principalCents,
-        platformFeeCents: 0,
+        grossCents: principalCents,
+        peerfundFeeCents,
+        bankingFeeCents,
+        netCents: netDisbursementCents,
       },
     });
   } catch (err) {
