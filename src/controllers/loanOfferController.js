@@ -454,7 +454,7 @@ exports.fundLoanByLender = async (req, res) => {
       });
     }
 
-    const paymentMethodType = paymentMethod?.type || 'us_bank_account';
+    const paymentMethodType = 'us_bank_account';
 
     console.log('🧾 Creating Stripe loan funding PaymentIntent', {
       loanId: loan.id,
