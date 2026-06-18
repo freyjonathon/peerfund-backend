@@ -379,7 +379,22 @@ exports.fundLoanByLender = async (req, res) => {
       return res.status(400).json({ error: 'Invalid principal amount' });
     }
 
-    const principalDollars = principalCents / 100;
+    const peerfundFeeCents = Math.round(principalCents * 0.01);
+    const bankingFeeCents = Math.round(principalCents * 0.01);
+    const netDisbursementCents =
+      principalCents - peerfundFeeCents - bankingFeeCents;
+
+    if (netDisbursementCents <= 0) {
+      return res.status(400).json({
+        error: 'Loan amount too small after fees.',
+        principalCents,
+        peerfundFeeCents,
+        bankingFeeCents,
+        netDisbursementCents,
+      });
+    }
+
+    const netDisbursementDollars = netDisbursementCents / 100;
 
     const lender = await prisma.user.findUnique({
       where: { id: lenderId },
@@ -388,7 +403,6 @@ exports.fundLoanByLender = async (req, res) => {
         name: true,
         email: true,
         stripeCustomerId: true,
-        fundingPaymentMethodId: true,
       },
     });
 
@@ -396,54 +410,60 @@ exports.fundLoanByLender = async (req, res) => {
       return res.status(404).json({ error: 'Lender not found' });
     }
 
-      let paymentMethodId = null;
-      let stripeCustomerId = lender.stripeCustomerId || null;
-      let paymentMethodSource = 'SAVED_ACH';
+    let paymentMethodId = null;
+    let stripeCustomerId = lender.stripeCustomerId || null;
+    const paymentMethodSource = 'SAVED_ACH';
 
-      const savedAch = await prisma.paymentMethod.findFirst({
-        where: {
-          userId: lenderId,
-          type: 'US_BANK',
-          status: 'ACTIVE',
-        },
-        orderBy: [
-          { isDefaultCharge: 'desc' },
-          { createdAt: 'desc' },
-        ],
-        select: {
-          stripePaymentMethodId: true,
-          stripeCustomerId: true,
-          type: true,
-          bankName: true,
-          last4: true,
-        },
+    const savedAch = await prisma.paymentMethod.findFirst({
+      where: {
+        userId: lenderId,
+        type: 'US_BANK',
+        status: 'ACTIVE',
+      },
+      orderBy: [
+        { isDefaultCharge: 'desc' },
+        { createdAt: 'desc' },
+      ],
+      select: {
+        stripePaymentMethodId: true,
+        stripeCustomerId: true,
+        type: true,
+        bankName: true,
+        last4: true,
+      },
+    });
+
+    console.log('🏦 Lender ACH lookup result', {
+      lenderId,
+      found: !!savedAch,
+      type: savedAch?.type,
+      bankName: savedAch?.bankName,
+      last4: savedAch?.last4,
+      stripePaymentMethodId: savedAch?.stripePaymentMethodId,
+    });
+
+    if (savedAch?.stripePaymentMethodId) {
+      paymentMethodId = savedAch.stripePaymentMethodId;
+      stripeCustomerId = savedAch.stripeCustomerId || stripeCustomerId;
+    }
+
+    if (!stripeCustomerId || !paymentMethodId) {
+      return res.status(400).json({
+        code: 'MISSING_LENDER_ACH_METHOD',
+        error: 'Please link a bank account before funding this loan.',
       });
-
-      console.log('🏦 Lender ACH lookup result', {
-        lenderId,
-        found: !!savedAch,
-        type: savedAch?.type,
-        bankName: savedAch?.bankName,
-        last4: savedAch?.last4,
-        stripePaymentMethodId: savedAch?.stripePaymentMethodId,
-      });
-
-      if (savedAch?.stripePaymentMethodId) {
-        paymentMethodId = savedAch.stripePaymentMethodId;
-        stripeCustomerId = savedAch.stripeCustomerId || stripeCustomerId;
-      }
-
-      if (!stripeCustomerId || !paymentMethodId) {
-        return res.status(400).json({
-          code: 'MISSING_LENDER_ACH_METHOD',
-          error: 'Please link a bank account before funding this loan.',
-        });
-      }
-
-    let paymentMethod;
+    }
 
     try {
-      paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId);
+      const paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId);
+
+      if (paymentMethod?.type !== 'us_bank_account') {
+        return res.status(400).json({
+          code: 'INVALID_PAYMENT_METHOD_TYPE',
+          error: 'Loan funding requires a saved ACH bank account.',
+          paymentMethodType: paymentMethod?.type,
+        });
+      }
     } catch (err) {
       console.error('Could not retrieve lender payment method:', err);
 
@@ -461,6 +481,9 @@ exports.fundLoanByLender = async (req, res) => {
       lenderId,
       borrowerId: loan.borrowerId,
       principalCents,
+      peerfundFeeCents,
+      bankingFeeCents,
+      netDisbursementCents,
       stripeCustomerId,
       paymentMethodId,
       paymentMethodType,
@@ -468,12 +491,6 @@ exports.fundLoanByLender = async (req, res) => {
     });
 
     let pi;
-
-    const peerfundFeeCents = Math.round(principalCents * 0.01);
-    const bankingFeeCents = Math.round(principalCents * 0.01);
-
-    const netDisbursementCents =
-      principalCents - peerfundFeeCents - bankingFeeCents;
 
     try {
       pi = await stripe.paymentIntents.create(
@@ -491,18 +508,16 @@ exports.fundLoanByLender = async (req, res) => {
             loanId: loan.id,
             lenderId,
             borrowerId: loan.borrowerId,
-
             principalCents: String(principalCents),
             peerfundFeeCents: String(peerfundFeeCents),
             bankingFeeCents: String(bankingFeeCents),
             netDisbursementCents: String(netDisbursementCents),
-
             paymentMethodSource,
             paymentMethodType,
           },
         },
         {
-            idempotencyKey: `peerfund-loan-funding-${loan.id}-${paymentMethodId}`,
+          idempotencyKey: `peerfund-loan-funding-${loan.id}-${paymentMethodId}`,
         }
       );
 
@@ -546,6 +561,12 @@ exports.fundLoanByLender = async (req, res) => {
           'Loan funding payment is processing. The borrower wallet will be credited once payment succeeds.',
         paymentIntentId: pi.id,
         loanId: loan.id,
+        disbursement: {
+          grossCents: principalCents,
+          peerfundFeeCents,
+          bankingFeeCents,
+          netCents: netDisbursementCents,
+        },
       });
     }
 
@@ -568,14 +589,6 @@ exports.fundLoanByLender = async (req, res) => {
           pendingCents: 0,
         },
       });
-
-
-
-      if (netDisbursementCents <= 0) {
-        throw new Error(
-          `Loan amount too small after fees. Principal=${principalCents}`
-        );
-      }
 
       const borrowerNewBalance =
         borrowerWallet.availableCents + netDisbursementCents;
@@ -618,7 +631,7 @@ exports.fundLoanByLender = async (req, res) => {
         await tx.transaction.create({
           data: {
             type: 'DISBURSEMENT',
-            amount: principalDollars,
+            amount: netDisbursementDollars,
             loanId: loan.id,
             fromUserId: lenderId,
             toUserId: loan.borrowerId,
@@ -634,7 +647,7 @@ exports.fundLoanByLender = async (req, res) => {
         where: { id: loan.id },
         data: {
           status: 'FUNDED',
-          disbursedAmount: netDisbursementCents / 100,
+          disbursedAmount: netDisbursementDollars,
           updatedAt: new Date(),
         },
       });
@@ -643,13 +656,16 @@ exports.fundLoanByLender = async (req, res) => {
         data: {
           userId: loan.borrowerId,
           type: 'WALLET',
-          message: `💸 Your loan has been funded. $${(
-            netDisbursementCents / 100
-          ).toFixed(2)} is now available in your PeerFund wallet.`,
+          message: `💸 Your loan has been funded. $${netDisbursementDollars.toFixed(
+            2
+          )} is now available in your PeerFund wallet.`,
           data: {
             loanId: loan.id,
             lenderId,
-            amountCents: principalCents,
+            grossAmountCents: principalCents,
+            peerfundFeeCents,
+            bankingFeeCents,
+            netDisbursementCents,
             stripePaymentIntentId: pi.id,
             paymentMethodSource,
             paymentMethodType,
