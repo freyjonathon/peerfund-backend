@@ -469,6 +469,12 @@ exports.fundLoanByLender = async (req, res) => {
 
     let pi;
 
+    const peerfundFeeCents = Math.round(principalCents * 0.01);
+    const bankingFeeCents = Math.round(principalCents * 0.01);
+
+    const netDisbursementCents =
+      principalCents - peerfundFeeCents - bankingFeeCents;
+
     try {
       pi = await stripe.paymentIntents.create(
         {
@@ -485,7 +491,12 @@ exports.fundLoanByLender = async (req, res) => {
             loanId: loan.id,
             lenderId,
             borrowerId: loan.borrowerId,
+
             principalCents: String(principalCents),
+            peerfundFeeCents: String(peerfundFeeCents),
+            bankingFeeCents: String(bankingFeeCents),
+            netDisbursementCents: String(netDisbursementCents),
+
             paymentMethodSource,
             paymentMethodType,
           },
@@ -558,11 +569,7 @@ exports.fundLoanByLender = async (req, res) => {
         },
       });
 
-      const peerfundFeeCents = Math.round(principalCents * 0.01);
-      const bankingFeeCents = Math.round(principalCents * 0.01);
 
-      const netDisbursementCents =
-        principalCents - peerfundFeeCents - bankingFeeCents;
 
       if (netDisbursementCents <= 0) {
         throw new Error(
