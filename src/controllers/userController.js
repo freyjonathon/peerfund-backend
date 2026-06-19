@@ -185,13 +185,15 @@ const upgradeToSuperUser = async (req, res) => {
         where: {
           userId,
           status: 'ACTIVE',
-          type: 'US_BANK',
-          isDefaultCharge: true,
         },
-        orderBy: { createdAt: 'desc' },
+        orderBy: [
+          { isDefaultCharge: 'desc' },
+          { createdAt: 'desc' },
+        ],
         select: {
           stripePaymentMethodId: true,
           stripeCustomerId: true,
+          type: true,
         },
       });
 
@@ -213,6 +215,13 @@ const upgradeToSuperUser = async (req, res) => {
     }
 
     const pm = await stripe.paymentMethods.retrieve(paymentMethodId);
+
+      if (pm.type !== 'us_bank_account') {
+        return res.status(400).json({
+          error:
+            'Please link a bank account in Wallet before upgrading to SuperUser.',
+        });
+      }
 
     if (!pm) {
       return res.status(400).json({
