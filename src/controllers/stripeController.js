@@ -10,7 +10,7 @@ exports.createCheckoutSession = async (req, res) => {
       mode: 'subscription',
       line_items: [
         {
-          price: 'price_1RqOBUGsm03jYeOaFzalJLpS',
+          price: 'price_1Tk7cYGtWSWdZ0gUaWDprEcB',
           quantity: 1,
         },
       ],
