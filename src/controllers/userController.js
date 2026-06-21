@@ -246,6 +246,8 @@ const upgradeToSuperUser = async (req, res) => {
       },
     });
 
+    console.log('SUPERUSER_PRICE_ID BEING USED:', SUPERUSER_PRICE_ID);
+
     const subscription = await stripe.subscriptions.create({
       customer: customerId,
       items: [{ price: SUPERUSER_PRICE_ID }],
