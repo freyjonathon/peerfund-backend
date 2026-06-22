@@ -338,13 +338,8 @@ exports.payNextRepayment = async (req, res) => {
     const borrowerId = req.user.userId;
     const { loanId } = req.params;
 
-    // DEFAULT NOW = saved payment method
-    const { paymentSource = 'saved_payment_method' } = req.body || {};
-
-    const normalizedSource =
-      paymentSource === 'wallet'
-        ? 'wallet'
-        : 'saved_payment_method';
+    // Repayments now only use saved ACH/bank account
+      const normalizedSource = 'saved_ach';
 
     console.log('🔔 payNextRepayment called', {
       loanId,
@@ -435,7 +430,7 @@ exports.payNextRepayment = async (req, res) => {
     // SAVED PAYMENT METHOD FLOW (DEFAULT)
     // =========================================================
 
-    if (normalizedSource === 'saved_payment_method') {
+    if (normalizedSource === 'saved_ach') {
       if (!stripe) {
         return res.status(500).json({
           error: 'Stripe not configured',
@@ -454,6 +449,7 @@ exports.payNextRepayment = async (req, res) => {
                 where: {
                   userId: borrowerId,
                   status: 'ACTIVE',
+                  type: 'US_BANK',
                 },
                 orderBy: [
                   { isDefaultCharge: 'desc' },
@@ -495,6 +491,12 @@ exports.payNextRepayment = async (req, res) => {
           await stripe.paymentMethods.retrieve(
             paymentMethodId
           );
+        if (paymentMethod?.type !== 'us_bank_account') {
+          return res.status(400).json({
+            code: 'ACH_REQUIRED',
+            error: 'Please use a saved bank account for repayments.',
+          });
+        }
       } catch (err) {
         console.error(
           'Could not retrieve repayment payment method:',

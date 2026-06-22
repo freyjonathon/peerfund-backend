@@ -124,6 +124,14 @@ const addPhoneNumber = async (req, res) => {
 /* ---------------- SuperUser upgrade via Stripe (card) ------------- */
 
 const upgradeToSuperUser = async (req, res) => {
+
+  console.log('🚀 upgradeToSuperUser HIT', {
+  cwd: process.cwd(),
+  file: __filename,
+  envPrice: process.env.STRIPE_SUPERUSER_PRICE_ID,
+  constantPrice: SUPERUSER_PRICE_ID,
+  });
+
   const userId = req.user.userId;
 
   try {
@@ -216,18 +224,18 @@ const upgradeToSuperUser = async (req, res) => {
 
     const pm = await stripe.paymentMethods.retrieve(paymentMethodId);
 
-      if (pm.type !== 'us_bank_account') {
-        return res.status(400).json({
-          error:
-            'Please link a bank account in Wallet before upgrading to SuperUser.',
-        });
-      }
-
     if (!pm) {
       return res.status(400).json({
         error: 'Saved payment method could not be verified. Please re-link your payment method.',
       });
     }
+
+    if (pm.type !== 'us_bank_account') {
+        return res.status(400).json({
+          error:
+            'Please link a bank account in Wallet before upgrading to SuperUser.',
+        });
+      }
 
     if (!pm.customer) {
       await stripe.paymentMethods.attach(paymentMethodId, {
