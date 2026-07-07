@@ -789,24 +789,29 @@ exports.withdrawFunds = async (req, res) => {
       });
 
       await tx.walletLedger.create({
-        data: {
-          walletId: wallet.id,
-          type: 'WITHDRAWAL',
-          amountCents,
-          direction: 'DEBIT',
-          balanceAfterCents: updated.availableCents,
-          referenceType: 'StripeTransfer',
-          referenceId: transfer.id,
-          metadata: {
-            provider: 'stripe',
-            status: 'TRANSFER_CREATED',
-            transferId: transfer.id,
-            destinationAccountId: user.stripeAccountId,
-            stripeAvailableBeforeCents: stripeAvailableUsdCents,
-            stripePendingBeforeCents: stripePendingUsdCents,
-          },
+      data: {
+        walletId: wallet.id,
+        type: 'WITHDRAWAL',
+        amountCents,
+        direction: 'DEBIT',
+        balanceAfterCents: updated.availableCents,
+
+        // referenceId must be a Mongo ObjectId-compatible value.
+        // The wallet.id is safe here; Stripe IDs belong in metadata.
+        referenceType: 'Wallet',
+        referenceId: wallet.id,
+
+        metadata: {
+          provider: 'stripe',
+          status: 'TRANSFER_CREATED',
+          stripeTransferId: transfer.id,
+          destinationAccountId: user.stripeAccountId,
+          stripeAvailableBeforeCents: stripeAvailableUsdCents,
+          stripePendingBeforeCents: stripePendingUsdCents,
+          purpose: 'wallet_withdrawal',
         },
-      });
+      },
+    });
 
       return updated;
     });
